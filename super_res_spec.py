@@ -6,6 +6,8 @@ import numpy as np
 import math
 from typing import List, Tuple
 
+from gompsnr.phase_related_losses import WeightedOmniPhaseLoss, CoupledOmniRILoss
+
 
 def get_dft_bases(n_fft, round_pow_of_two=True):
     # Ref: https://en.wikipedia.org/wiki/DFT_matrix#Definition
@@ -260,6 +262,70 @@ class MultiResConsistencyLoss(nn.Module):
         return total_loss, details
 
 
+class GOMPSNRLoss(nn.Module):
+    def __init__(self, config: STFTConfig, wop_weight=1.0, cori_weight=1.0):
+        super().__init__()
+        self.config = config
+        self.wop_weight = wop_weight
+        self.cori_weight = cori_weight
+        
+        self.wop_loss = WeightedOmniPhaseLoss(alpha=100) 
+        self.cori_loss = CoupledOmniRILoss(mag_dist_type="L1")
+
+        self.win_len = config.base_win_len
+        self.hop_len = config.base_hop_len
+        self.n_fft = config.base_win_len
+        self.register_buffer('window', torch.hann_window(self.win_len))
+
+    def forward(self, x_recon, x_gt):
+        """
+        x_recon: (Batch, 1, Time) or (Batch, Time) - Decoder 生成的波形
+        x_gt:    (Batch, 1, Time) or (Batch, Time) - 真实波形
+        """
+        if x_recon.dim() == 3:
+            x_recon = x_recon.squeeze(1)
+        if x_gt.dim() == 3:
+            x_gt = x_gt.squeeze(1)
+
+        # 1. 执行 STFT 变换
+        spec_recon = torch.stft(
+            x_recon, n_fft=self.n_fft, hop_length=self.hop_len, 
+            win_length=self.win_len, window=self.window, 
+            return_complex=True
+        )
+        spec_gt = torch.stft(
+            x_gt, n_fft=self.n_fft, hop_length=self.hop_len, 
+            win_length=self.win_len, window=self.window, 
+            return_complex=True
+        )
+
+        # 2. 提取论文 Loss 所需的特征
+        rea_g, imag_g = spec_recon.real, spec_recon.imag
+        rea, imag = spec_gt.real, spec_gt.imag
+        mag = torch.sqrt(rea**2 + imag**2 + 1e-8)
+        pha_g = torch.atan2(imag_g, rea_g)
+        pha = torch.atan2(imag, rea)
+
+        loss_dict = {}
+        total_loss = 0.0
+
+        # 3. 计算 WOP Loss (加权全向相位损失)
+        if self.wop_weight > 0:
+            # WOP forward: (phase_target, phase_estimate, mag_target)
+            l_wop = self.wop_loss(pha, pha_g, mag)
+            total_loss += l_wop * self.wop_weight
+            loss_dict['loss_wop'] = l_wop.item()
+
+        # 4. 计算 CORI Loss (耦合全向实虚部损失)
+        if self.cori_weight > 0:
+            # CORI forward: (rea_target, imag_target, rea_est, imag_est)
+            l_cori = self.cori_loss(rea, imag, rea_g, imag_g)
+            total_loss += l_cori * self.cori_weight
+            loss_dict['loss_cori'] = l_cori.item()
+
+        return total_loss, loss_dict
+    
+
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Running on device: {device}\n")
@@ -272,6 +338,7 @@ if __name__ == "__main__":
     encoder = SuperResEncoder(cfg).to(device)
     decoder = SuperResDecoder(cfg).to(device)
     criterion = MultiResConsistencyLoss(cfg).to(device)
+    decoder_criterion = GOMPSNRLoss(cfg).to(device)
     
     # 3. Data
     rand_len = int(16000 * 1.0)
@@ -283,27 +350,30 @@ if __name__ == "__main__":
     print(f"Encoder Output (Complex): {z_complex.shape}")
     
     # 5. Loss Calculation
-    loss, details = criterion(z_complex, x, verbose=True)
-    print(f"\nTotal Loss: {loss.item():.5f}")
-    print(f"Details: {details}")
+    multi_loss, multi_details = criterion(z_complex, x, verbose=True)
+    print(f"\nMultiResConsistency Loss: {multi_loss.item():.6f}, Details: {multi_details}")
     
     # 6. Decoder Forward
     x_recon = decoder(z_complex)
     print(f"\nDecoder Output (Waveform): {x_recon.shape}")
     
-    # 7. Check Reconstruction (Sanity Check)
+    # 7. Check Reconstruction
     recon_loss = F.mse_loss(x, x_recon)
-    print(f"Reconstruction MSE (Untrained): {recon_loss.item():.6f}")
+    print(f"\nReconstruction MSE Loss: {recon_loss.item():.6f}")
+
+    # 8. GOMPSNR Loss Calculation
+    gompsnr_loss, gompsnr_details = decoder_criterion(x_recon, x)
+    print(f"\nGOMPSNR Loss: {gompsnr_loss.item():.6f}, Details: {gompsnr_details}")
     
-    # 8. Test Gradients
+    # 9. Test Gradients
     optim = torch.optim.Adam(list(encoder.parameters()) + 
                              list(decoder.parameters()) + 
                              list(criterion.parameters()), lr=1e-3)
     optim.zero_grad()
-    total_loss = loss + recon_loss
+    total_loss = multi_loss + recon_loss + gompsnr_loss
     total_loss.backward()
     optim.step()
     print("\nBackprop successful. Learnable kernels updated.")
-    print("Learned Time Downsample Kernels:")
-    for k, v in criterion.kernel_win.items():
-        print(f"  Factor {k}: {v.data.cpu().numpy()}")
+    # print("Learned Time Downsample Kernels:")
+    # for k, v in criterion.kernel_win.items():
+    #     print(f"  Factor {k}: {v.data.cpu().numpy()}")
