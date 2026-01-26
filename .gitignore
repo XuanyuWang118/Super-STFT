@@ -2,3 +2,5 @@
 *.pyc
 *.pyo
 *.pyd
+exp/
+slurm_logs/

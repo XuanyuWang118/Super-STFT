@@ -1,0 +1,49 @@
+# ================= Audio Settings =================
+audio:
+  sample_rate: 16000
+  segment_length: 1.0  # 训练时裁剪的音频长度(秒)
+
+# ================= Data Paths =================
+dataset:
+  train_scp: "../egs2/vctk_noisy/enh1/dump/raw/tr_26spk/wav.scp"
+  valid_scp: "../egs2/vctk_noisy/enh1/dump/raw/cv_2spk/wav.scp"
+  test_scp: "../egs2/vctk_noisy/enh1/dump/raw/tt_2spk/wav.scp"
+
+# ================= Training Settings =================
+train:
+  exp_dir: "./exp"
+  batch_size: 4
+  num_workers: 4
+  epochs: 50
+  learning_rate: 0.001
+  grad_clip: 5.0
+  log_interval: 100
+  seed: 42
+
+# ================= STFT Settings =================
+stft:
+  target_resolutions: 
+    - [64, 32]
+    - [32, 16]
+    - [16, 8]
+    - [8, 4]
+    - [4, 2]
+    - [2, 1]
+  super_hop_ms: 1.0
+
+# ================= Model Settings =================
+model:
+  encoder_init: "dft"
+  decoder_init: "idft"
+
+# ================= Loss Weights =================
+# 这里的权重将在 train.py 中被调用进行加权计算
+loss:
+  multi_res_weight: 20.0
+  resolution_weights: [] # 如果为空，则使用均等权重
+  recon_weight: 200.0
+  gompsnr_weight: 10.0
+  wop_weight: 1.0
+  cori_weight: 1.0
+  wop_alpha: 100
+  mag_dist_type: "L1"
