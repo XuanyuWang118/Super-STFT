@@ -15,38 +15,6 @@ def get_dft_bases(n_fft, round_pow_of_two=True):
     return dft_bases
 
 
-def create_triangular_filterbank(n_freq_in, n_freq_out, sr):
-    """
-    创建从高分辨率(n_freq_in)到低分辨率(n_freq_out)的三角滤波器组矩阵
-    返回矩阵形状: (n_freq_out, n_freq_in)
-    """
-    # 1. 定义频率轴 (Hz)
-    # n_freq_in 对应 0 ~ sr/2
-    f_in = torch.linspace(0, sr / 2, n_freq_in)
-    f_out = torch.linspace(0, sr / 2, n_freq_out)
-    
-    # 2. 计算低分辨率的带宽 (Bin Width)
-    # f_out 是均匀分布的，间距即为带宽
-    if n_freq_out > 1:
-        delta_f = f_out[1] - f_out[0]
-    else:
-        delta_f = sr / 2 # 只有一个点的情况
-    
-    # 3. 利用广播计算权重矩阵 (F_out, F_in)
-    # shape: (F_out, 1) - (1, F_in) -> (F_out, F_in)
-    diff = torch.abs(f_out.unsqueeze(1) - f_in.unsqueeze(0))
-    
-    # 三角核公式: max(0, 1 - |f_in - f_out| / delta_f)
-    weights = torch.clamp(1 - diff / delta_f, min=0)
-    
-    # 4. 归一化 (按行归一化，确保每个目标频点的能量守恒)
-    # 加上 eps 防止除以 0
-    row_sums = weights.sum(dim=1, keepdim=True)
-    weights = weights / (row_sums + 1e-8)
-    
-    return weights
-
-
 class STFTConfig:
     def __init__(self, cfg_dict: Dict[str, Any] = None, yaml_path: str = None):
         """
@@ -189,30 +157,19 @@ class MultiResConsistencyLoss(nn.Module):
     def __init__(self, config: STFTConfig):
         super().__init__()
         self.config = config
+        
         self.kernel_win = nn.ParameterDict()
-        self.freq_downsamplers = nn.ModuleDict()
-
         for win_ms, hop_ms in self.config.target_resolutions:
-
-            # 1. Time Downsampling Kernels
             target_hop_len = int(self.config.sr * hop_ms / 1000)
             base_hop_len = self.config.base_hop_len
+            
             time_factor = target_hop_len // base_hop_len
             time_factor = max(1, time_factor)
+            
             key = str(time_factor)
             if time_factor > 1 and key not in self.kernel_win:
                 weight = torch.ones(time_factor)
                 self.kernel_win[key] = nn.Parameter(weight)
-            
-            # 2. Frequency Downsampling Matrices
-            target_win_len = int(self.config.sr * win_ms / 1000)
-            base_win_len = self.config.base_win_len
-            if base_win_len > target_win_len:
-                n_freq_in = base_win_len // 2 + 1
-                n_freq_out = target_win_len // 2 + 1
-                mat = create_triangular_filterbank(n_freq_in, n_freq_out, self.config.sr)
-                key_freq = f"mat_{win_ms}_{hop_ms}"
-                self.register_buffer(key_freq, mat)
 
     def forward(self, pred_super_complex, raw_audio, verbose=False):
         total_loss = 0.0
@@ -244,10 +201,22 @@ class MultiResConsistencyLoss(nn.Module):
             curr_pred = pred_super_complex
             
             # 2. Freq Downsampling
-            if base_win_len > target_win_len:
-                key_freq = f"mat_{win_ms}_{hop_ms}"
-                W = getattr(self, key_freq)
-                curr_pred = torch.einsum('bitc,oi->botc', curr_pred, W)
+            freq_factor = base_win_len // target_win_len
+            
+            if freq_factor > 1:
+                curr_pred = curr_pred.permute(0, 2, 3, 1) 
+                B_temp, T_temp, C_temp, F_in = curr_pred.shape 
+                curr_pred = curr_pred.reshape(-1, C_temp, F_in) 
+
+                target_n_freq = target_win_len // 2 + 1
+                expected_len = target_n_freq * freq_factor
+                pad_amt = expected_len - F_in
+                
+                if pad_amt > 0:
+                    curr_pred = F.pad(curr_pred, (0, pad_amt), mode='replicate')
+                
+                curr_pred = F.avg_pool1d(curr_pred, kernel_size=freq_factor, stride=freq_factor)
+                curr_pred = curr_pred.view(B_temp, T_temp, C_temp, -1).permute(0, 3, 1, 2)
 
             # 3. Time Downsampling
             time_factor = target_hop_len // base_hop_len
@@ -402,7 +371,7 @@ if __name__ == "__main__":
     
     # 4. Forward & Backward
     z_complex = encoder(x)
-    multi_loss, multi_details = criterion(z_complex, x, verbose=True)
+    multi_loss, multi_details = criterion(z_complex, x, verbose=False)
     
     x_recon = decoder(z_complex)
     recon_loss = F.mse_loss(x, x_recon)
