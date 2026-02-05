@@ -91,12 +91,13 @@ class STFTConfig:
             assert len(self.resolution_weights) == len(self.target_resolutions), "Resolution weights length mismatch"
 
         self.recon_weight = loss_cfg.get('recon_weight', 1.0)
-        
-        self.gompsnr_weight = loss_cfg.get('gompsnr_weight', 1.0)
-        self.wop_weight = loss_cfg.get('wop_weight', 1.0)
-        self.cori_weight = loss_cfg.get('cori_weight', 1.0)
-        self.wop_alpha = loss_cfg.get('wop_alpha', 100)
-        self.mag_dist_type = loss_cfg.get('mag_dist_type', 'L1')
+        self.sisnr_weight = loss_cfg.get('sisnr_weight', 1.0)
+        gompsnr_weight = loss_cfg.get('gompsnr_weight', {})
+        self.gompsnr_weight = gompsnr_weight.get('weight', 1.0)
+        self.wop_weight = gompsnr_weight.get('wop_weight', 1.0)
+        self.cori_weight = gompsnr_weight.get('cori_weight', 1.0)
+        self.wop_alpha = gompsnr_weight.get('wop_alpha', 100)
+        self.mag_dist_type = gompsnr_weight.get('mag_dist_type', 'L1')
 
         # 5. Derived Params (Calculated)
         self.max_win_ms = max([r[0] for r in self.target_resolutions])
@@ -373,6 +374,45 @@ class GOMPSNRLoss(nn.Module):
         return total_loss, loss_dict
     
 
+class SISNRLoss(nn.Module):
+    def __init__(self, eps=1e-8):
+        """
+        Scale-Invariant Signal-to-Noise Ratio Loss
+        """
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, preds, target):
+        """
+        preds: (Batch, 1, Time) - Decoder 重构的波形
+        target: (Batch, 1, Time) - 原始参考波形
+        """
+        # 去掉 Channel 维度
+        preds = preds.squeeze(1)
+        target = target.squeeze(1)
+
+        # 1. 中心化 (Zero-mean)
+        preds = preds - torch.mean(preds, dim=-1, keepdim=True)
+        target = target - torch.mean(target, dim=-1, keepdim=True)
+
+        # 2. 计算目标投影: target_proj = <preds, target> * target / ||target||^2
+        dot_product = torch.sum(preds * target, dim=-1, keepdim=True)
+        target_energy = torch.sum(target**2, dim=-1, keepdim=True) + self.eps
+        target_projected = (dot_product / target_energy) * target
+
+        # 3. 计算噪声能量: noise = preds - target_proj
+        noise = preds - target_projected
+        
+        sig_energy = torch.sum(target_projected**2, dim=-1)
+        noise_energy = torch.sum(noise**2, dim=-1)
+
+        # 4. 计算 SI-SNR: 10 * log10(sig_energy / noise_energy)
+        si_snr = 10 * torch.log10(sig_energy / (noise_energy + self.eps) + self.eps)
+
+        # 返回负均值作为 Loss
+        return -torch.mean(si_snr)
+
+
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Running on device: {device}\n")
@@ -392,8 +432,9 @@ if __name__ == "__main__":
     # 2. Models
     encoder = SuperResEncoder(cfg).to(device)
     decoder = SuperResDecoder(cfg).to(device)
-    criterion = MultiResConsistencyLoss(cfg).to(device)
-    decoder_criterion = GOMPSNRLoss(cfg).to(device)
+    mrc_loss = MultiResConsistencyLoss(cfg).to(device)
+    gompsnr_loss = GOMPSNRLoss(cfg).to(device)
+    sisnr_loss = SISNRLoss().to(device)
     
     # 3. Data
     rand_len = int(16000 * 1.0)
@@ -402,24 +443,24 @@ if __name__ == "__main__":
     
     # 4. Forward & Backward
     z_complex = encoder(x)
-    multi_loss, multi_details = criterion(z_complex, x, verbose=True)
-    
+    multi_loss, multi_details = mrc_loss(z_complex, x, verbose=False)
     x_recon = decoder(z_complex)
     recon_loss = F.mse_loss(x, x_recon)
-    
-    gompsnr_loss, gompsnr_details = decoder_criterion(x_recon, x)
+    gompsnr_loss, gompsnr_details = gompsnr_loss(x_recon, x)
+    sisnr_loss = sisnr_loss(x_recon, x)
     
     # Aggregate
-    total_loss = multi_loss * cfg.multi_res_weight + recon_loss * cfg.recon_weight + gompsnr_loss * cfg.gompsnr_weight
+    total_loss = multi_loss * cfg.multi_res_weight + recon_loss * cfg.recon_weight + gompsnr_loss * cfg.gompsnr_weight + sisnr_loss * cfg.sisnr_weight
     
     print(f"\nTotal Loss: {total_loss.item():.6f}")
     print(f"  MultiRes: {multi_loss.item():.6f}")
     print(f"  Recon:    {recon_loss.item():.6f}")
     print(f"  GOMPSNR:  {gompsnr_loss.item():.6f}")
+    print(f"  SI-SNR:   {sisnr_loss.item():.6f}")
 
     optim = torch.optim.Adam(list(encoder.parameters()) + 
                              list(decoder.parameters()) + 
-                             list(criterion.parameters()), lr=1e-3)
+                             list(mrc_loss.parameters()), lr=1e-3)
     optim.zero_grad()
     total_loss.backward()
     optim.step()
