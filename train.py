@@ -1,4 +1,5 @@
 import os
+import sys
 import shutil
 import yaml
 import random
@@ -6,6 +7,7 @@ import time
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import soundfile as sf
 from torch.utils.data import Dataset, DataLoader
@@ -16,21 +18,29 @@ from super_res_spec import (
     SuperResEncoder, 
     SuperResDecoder, 
     MultiResConsistencyLoss, 
-    GOMPSNRLoss
+    GOMPSNRLoss, 
+    SISNRLoss
 )
 
-# 设置绘图风格
-plt.rcParams['font.family'] = 'sans-serif'
+class TeeLogger(object):
+    """同时将输出打印到屏幕和文件"""
+    def __init__(self, filename):
+        self.terminal = sys.stdout
+        self.terminal = sys.stderr
+        self.log = open(filename, "w", encoding='utf-8')
 
-# ==========================================
-# 1. Dataset Class
-# ==========================================
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()  # 确保实时写入
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+
 class VCTKDataset(Dataset):
     def __init__(self, scp_path, sample_rate=16000, segment_length=1.0, is_train=True):
-        """
-        读取 wav.scp 文件。
-        Format: key /path/to/audio.wav
-        """
         self.data_list = []
         if not os.path.exists(scp_path):
             print(f"[Warning] SCP file not found: {scp_path}")
@@ -41,7 +51,7 @@ class VCTKDataset(Dataset):
                     if not line: continue
                     parts = line.split()
                     if len(parts) >= 2:
-                        self.data_list.append(parts[1]) # 只存路径
+                        self.data_list.append(parts[1])
         
         self.sr = sample_rate
         self.seg_len_samples = int(sample_rate * segment_length)
@@ -54,47 +64,28 @@ class VCTKDataset(Dataset):
     def __getitem__(self, idx):
         wav_path = self.data_list[idx]
         if os.path.exists(wav_path) is False:
+            # 兼容你的路径映射逻辑
             path_head = "/exp/xuanyu.wang/espnet_20250624/egs2/vctk_noisy/enh1"
             wav_path = os.path.join(path_head, wav_path)
-        # 读取音频
         try:
-            # audio shape: (Time,)
             audio, sr = sf.read(wav_path, dtype='float32')
-            
-            # 重采样检查 (简单的 assert，实际工程可能需要 resample)
             if sr != self.sr:
-                raise ValueError(f"Sample rate mismatch: expected {self.sr}, got {sr}")
-            
-            # 单声道检查
+                raise ValueError(f"SR mismatch: {sr} vs {self.sr}")
             if audio.ndim > 1:
-                audio = audio[:, 0] # 取第一通道
+                audio = audio[:, 0]
 
-            current_len = audio.shape[0]
-
-            # 裁剪或填充逻辑
-            if current_len >= self.seg_len_samples:
-                if self.is_train:
-                    # 随机裁剪
-                    start = random.randint(0, current_len - self.seg_len_samples)
-                else:
-                    # 验证集中心裁剪或从头开始
-                    start = 0
+            if audio.shape[0] >= self.seg_len_samples:
+                start = random.randint(0, audio.shape[0] - self.seg_len_samples) if self.is_train else 0
                 audio_seg = audio[start : start + self.seg_len_samples]
             else:
-                # 填充
-                pad_len = self.seg_len_samples - current_len
-                audio_seg = np.pad(audio, (0, pad_len), mode='constant')
+                audio_seg = np.pad(audio, (0, self.seg_len_samples - audio.shape[0]), mode='constant')
 
-            # 转为 Tensor (1, Time)
             return torch.from_numpy(audio_seg).unsqueeze(0)
-
         except Exception as e:
             print(f"Error loading {wav_path}: {e}")
             return torch.zeros(1, self.seg_len_samples)
 
-# ==========================================
-# 2. Utils
-# ==========================================
+
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -102,278 +93,216 @@ def set_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+
 def plot_history(history, save_dir):
-    """
-    绘制 Loss 曲线：红(Train) 蓝(Valid)
-    """
     os.makedirs(save_dir, exist_ok=True)
-    
-    # history 结构: {'train': {'total':[], 'multi':[], ...}, 'valid': {...}}
-    metrics = ['total', 'multi_res', 'recon', 'gompsnr']
-    
-    plt.figure(figsize=(15, 10))
-    
+    plt.rcParams['font.family'] = 'sans-serif'
+    metrics = ['total', 'multi_res', 'recon', 'gompsnr', 'sisnr']
+    plt.figure(figsize=(15, 12))
     for i, metric in enumerate(metrics):
-        plt.subplot(2, 2, i+1)
-        
+        plt.subplot(3, 2, i+1)
         train_vals = history['train'].get(metric, [])
         valid_vals = history['valid'].get(metric, [])
         epochs = range(1, len(train_vals) + 1)
-        
-        plt.plot(epochs, train_vals, color='red', label='Train', linewidth=1.5)
-        if len(valid_vals) > 0:
-            # 验证集通常比训练集少一个点或者对齐，这里做长度保护
-            v_epochs = range(1, len(valid_vals) + 1)
-            plt.plot(v_epochs, valid_vals, color='blue', label='Valid', linewidth=1.5, linestyle='--')
-            
-        plt.title(f'{metric.replace("_", " ").upper()} Loss')
-        plt.xlabel('Epochs')
-        plt.ylabel('Loss')
-        plt.grid(True, alpha=0.3)
-        plt.legend()
-
+        plt.plot(epochs, train_vals, color='red', label='Train')
+        if valid_vals:
+            plt.plot(range(1, len(valid_vals) + 1), valid_vals, color='blue', label='Valid', linestyle='--')
+        plt.title(f'{metric.upper()} Loss')
+        plt.grid(True, alpha=0.3); plt.legend()
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, 'loss_curves.png'), dpi=150)
     plt.close()
 
-# ==========================================
-# 3. Trainer
-# ==========================================
-def train_one_epoch(models, criterions, optimizer, dataloader, loss_cfg, train_cfg, device, epoch):
+
+def train_one_epoch(models, criterions, optimizer, dataloader, config, device, epoch):
     encoder, decoder = models['enc'], models['dec']
-    crit_multi, crit_gompsnr = criterions['multi'], criterions['gompsnr']
+    crit_multi, crit_gompsnr, crit_sisnr = criterions['multi'], criterions['gompsnr'], criterions['sisnr']
     
-    encoder.train()
-    decoder.train()
-    crit_multi.train() 
-    
-    loss_meter = {'total': 0.0, 'multi_res': 0.0, 'recon': 0.0, 'gompsnr': 0.0}
-    steps = 0
+    encoder.train(); decoder.train(); crit_multi.train() 
+    loss_meter = {k: 0.0 for k in ['total', 'multi_res', 'recon', 'gompsnr', 'sisnr']}
     
     for batch_idx, x in enumerate(dataloader):
-        x = x.to(device) # (B, 1, T)
-        
+        x = x.to(device)
         optimizer.zero_grad()
         
-        # 1. Forward
         z_complex = encoder(x)
         x_recon = decoder(z_complex)
         
-        # 2. Loss Calculation (Raw Unweighted)
+        # 计算原始 Loss
         multi_loss_raw, _ = crit_multi(z_complex, x)
         recon_loss_raw = F.mse_loss(x, x_recon)
         gompsnr_loss_raw, _ = crit_gompsnr(x_recon, x)
+        sisnr_loss_raw = crit_sisnr(x_recon, x) 
+
+        # 使用 config 对象进行外部加权
+        loss_total = (multi_loss_raw * config.multi_res_weight + 
+                      recon_loss_raw * config.recon_weight + 
+                      gompsnr_loss_raw * config.gompsnr_weight +
+                      sisnr_loss_raw * config.sisnr_weight)
         
-        # 3. Weighted Sum (使用 loss_cfg 获取权重)
-        loss_total = (multi_loss_raw * loss_cfg.multi_res_weight + recon_loss_raw * loss_cfg.recon_weight + gompsnr_loss_raw * loss_cfg.gompsnr_weight)
-        
-        # 4. Backward
         loss_total.backward()
-        
-        # Gradient Clipping (使用 train_cfg 获取 grad_clip)
-        clip_grad_norm_(encoder.parameters(), train_cfg.grad_clip)
-        clip_grad_norm_(decoder.parameters(), train_cfg.grad_clip)
-        clip_grad_norm_(crit_multi.parameters(), train_cfg.grad_clip)
-        
+        clip_grad_norm_(list(encoder.parameters())+list(decoder.parameters())+list(crit_multi.parameters()), config.grad_clip)
         optimizer.step()
         
-        # Record
+        # 记录
         loss_meter['total'] += loss_total.item()
         loss_meter['multi_res'] += multi_loss_raw.item()
         loss_meter['recon'] += recon_loss_raw.item()
         loss_meter['gompsnr'] += gompsnr_loss_raw.item()
-        steps += 1
+        loss_meter['sisnr'] += sisnr_loss_raw.item()
         
-        # Logging (使用 train_cfg 获取 log_interval)
-        if batch_idx % train_cfg.log_interval == 0:
-            print(f"Train Epoch: {epoch} [{batch_idx}/{len(dataloader)}] "
-                  f"Loss: {loss_total.item():.4f} "
-                  f"(M:{multi_loss_raw.item():.4f} R:{recon_loss_raw.item():.4f} G:{gompsnr_loss_raw.item():.4f})")
+        if batch_idx % config.log_interval == 0:
+            print(f"Epoch: {epoch} [{batch_idx}/{len(dataloader)}] Loss: {loss_total.item():.4f} "
+                  f"(M:{multi_loss_raw.item():.2f} R:{recon_loss_raw.item():.2f} G:{gompsnr_loss_raw.item():.2f} S:{sisnr_loss_raw.item():.2f})")
             
-    # Average
-    for k in loss_meter:
-        loss_meter[k] /= steps
-        
-    return loss_meter
+    return {k: v / len(dataloader) for k, v in loss_meter.items()}
 
-def validate(models, criterions, dataloader, cfg, device):
+
+def validate(models, criterions, dataloader, config, device):
     encoder, decoder = models['enc'], models['dec']
-    crit_multi, crit_gompsnr = criterions['multi'], criterions['gompsnr']
+    crit_multi, crit_gompsnr, crit_sisnr = criterions['multi'], criterions['gompsnr'], criterions['sisnr']
+    encoder.eval(); decoder.eval(); crit_multi.eval()
     
-    encoder.eval()
-    decoder.eval()
-    crit_multi.eval()
-    
-    loss_meter = {'total': 0.0, 'multi_res': 0.0, 'recon': 0.0, 'gompsnr': 0.0}
-    steps = 0
-    
+    loss_meter = {k: 0.0 for k in ['total', 'multi_res', 'recon', 'gompsnr', 'sisnr']}
     with torch.no_grad():
         for x in dataloader:
             x = x.to(device)
-            
             z_complex = encoder(x)
             x_recon = decoder(z_complex)
             
             multi_loss_raw, _ = crit_multi(z_complex, x)
             recon_loss_raw = F.mse_loss(x, x_recon)
             gompsnr_loss_raw, _ = crit_gompsnr(x_recon, x)
+            sisnr_loss_raw = crit_sisnr(x_recon, x)
             
-            loss_total = (multi_loss_raw * cfg.multi_res_weight + recon_loss_raw * cfg.recon_weight + gompsnr_loss_raw * cfg.gompsnr_weight)
+            loss_total = (multi_loss_raw * config.multi_res_weight + 
+                          recon_loss_raw * config.recon_weight + 
+                          gompsnr_loss_raw * config.gompsnr_weight +
+                          sisnr_loss_raw * config.sisnr_weight)
             
             loss_meter['total'] += loss_total.item()
             loss_meter['multi_res'] += multi_loss_raw.item()
             loss_meter['recon'] += recon_loss_raw.item()
             loss_meter['gompsnr'] += gompsnr_loss_raw.item()
-            steps += 1
+            loss_meter['sisnr'] += sisnr_loss_raw.item()
             
-    for k in loss_meter:
-        loss_meter[k] /= steps
-        
-    return loss_meter
+    return {k: v / len(dataloader) for k, v in loss_meter.items()}
 
-# ==========================================
-# 4. Main
-# ==========================================
+
 def main():
-    # torch.autograd.set_detect_anomaly(True) 
-    
-    # 1. Load Config
-    config_path = "config.yaml"
-    with open(config_path, 'r') as f:
+    # 1. 配置加载与重构
+    yaml_path = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
+    with open(yaml_path, 'r') as f:
         config_dict = yaml.safe_load(f)
     
-    # 实例化 STFTConfig 用于模型初始化
-    stft_cfg = STFTConfig(cfg_dict=config_dict)
-    
-    # 获取各部分配置字典
-    train_cfg = config_dict['train']
-    loss_cfg = config_dict['loss']
-    dataset_cfg = config_dict['dataset']
-    audio_cfg = config_dict['audio']
-    
-    # 2. Setup Directories
-    exp_dir = train_cfg['exp_dir']
-    image_dir = os.path.join(exp_dir, "image")
+    # 实例化 STFTConfig，并手动将 train 相关的字典参数注入，实现全属性访问
+    config = STFTConfig(cfg_dict=config_dict)
+    # 将 train 字典中的 key 变成 config 的属性
+    for k, v in config_dict.get('train', {}).items():
+        setattr(config, k, v)
+    # 将 dataset 字典中的内容也挂载方便使用
+    config.dataset = config_dict.get('dataset', {})
+
+    # 2. 目录准备与日志重定向
+    os.makedirs(config.exp_dir, exist_ok=True)
+    image_dir = os.path.join(config.exp_dir, "image")
     os.makedirs(image_dir, exist_ok=True)
     
-    # 备份配置文件
-    shutil.copy(config_path, os.path.join(exp_dir, "config.yaml"))
+    # 启用自动日志
+    log_path = os.path.join(config.exp_dir, "train.log")
+    logger = TeeLogger(log_path)
+    sys.stdout = logger  # 重定向标准输出
+    sys.stderr = logger  # 重定向标准错误
+
+    # 备份配置
+    shutil.copy(yaml_path, os.path.join(config.exp_dir, "config.yaml"))
     
-    # 3. Print Info
-    print("="*60)
-    print(f"Experiment Dir: {exp_dir}")
-    print(f"STFT Config: {stft_cfg}")
-    print(f"Train Config: Epochs={train_cfg['epochs']}, BS={train_cfg['batch_size']}, LR={train_cfg['learning_rate']}")
-    print("="*60)
+    print("="*100)
+    print(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Experiment Directory: {config.exp_dir}")
+    print(f"Full Config: {config}")
+    print("="*100)
     
-    # 4. Initialization
-    set_seed(train_cfg['seed'])
+    set_seed(config.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # DataLoaders
-    train_ds = VCTKDataset(dataset_cfg['train_scp'], sample_rate=audio_cfg['sample_rate'],
-                           segment_length=audio_cfg['segment_length'], is_train=True)
-    valid_ds = VCTKDataset(dataset_cfg['valid_scp'], sample_rate=audio_cfg['sample_rate'],
-                           segment_length=audio_cfg['segment_length'], is_train=False)
+    # 3. DataLoaders
+    train_loader = DataLoader(VCTKDataset(config.dataset['train_scp'], is_train=True), 
+                              batch_size=config.batch_size, shuffle=True, num_workers=config.num_workers)
+    valid_loader = DataLoader(VCTKDataset(config.dataset['valid_scp'], is_train=False), 
+                              batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers)
     
-    train_loader = DataLoader(train_ds, batch_size=train_cfg['batch_size'], 
-                              shuffle=True, num_workers=train_cfg['num_workers'], pin_memory=True)
-    valid_loader = DataLoader(valid_ds, batch_size=train_cfg['batch_size'], 
-                              shuffle=False, num_workers=train_cfg['num_workers'], pin_memory=True)
-    
-    # Models & Loss
-    encoder = SuperResEncoder(stft_cfg).to(device)
-    decoder = SuperResDecoder(stft_cfg).to(device)
-    crit_multi = MultiResConsistencyLoss(stft_cfg).to(device)
-    crit_gompsnr = GOMPSNRLoss(stft_cfg).to(device)
+    # 4. Models & Criterions
+    encoder = SuperResEncoder(config).to(device)
+    decoder = SuperResDecoder(config).to(device)
+    crit_multi = MultiResConsistencyLoss(config).to(device)
+    crit_gompsnr = GOMPSNRLoss(config).to(device)
+    crit_sisnr = SISNRLoss().to(device)
     
     models = {'enc': encoder, 'dec': decoder}
-    criterions = {'multi': crit_multi, 'gompsnr': crit_gompsnr}
+    criterions = {'multi': crit_multi, 'gompsnr': crit_gompsnr, 'sisnr': crit_sisnr}
     
-    # Optimizer
-    all_params = list(encoder.parameters()) + \
-                 list(decoder.parameters()) + \
-                 list(crit_multi.parameters())
-    optimizer = torch.optim.Adam(all_params, lr=train_cfg['learning_rate'])
-    
-    # History
-    history = {
-        'train': {'total':[], 'multi_res':[], 'recon':[], 'gompsnr':[]},
-        'valid': {'total':[], 'multi_res':[], 'recon':[], 'gompsnr':[]}
-    }
-    
-    # 5. Saving State Variables
-    best_loss = float('inf')
-    best_checkpoint_path = None # 记录历史最佳模型文件的路径 
-    last_checkpoint_path = None # 记录上一轮模型文件的路径
-    
-    # 6. Training Loop
-    print("\nStart Training...")
-    for epoch in range(1, train_cfg['epochs'] + 1):
-        start_time = time.time()
-        
-        from types import SimpleNamespace
-        loss_cfg_ns = SimpleNamespace(**loss_cfg)
-        train_cfg_ns = SimpleNamespace(**train_cfg)
+    optimizer = torch.optim.Adam(list(encoder.parameters()) + list(decoder.parameters()) + 
+                                 list(crit_multi.parameters()), lr=config.learning_rate)
 
-        train_metrics = train_one_epoch(models, criterions, optimizer, train_loader, loss_cfg_ns, train_cfg_ns, device, epoch)
-        valid_metrics = validate(models, criterions, valid_loader, loss_cfg_ns, device)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=config.lr_factor,
+                                                            patience=config.lr_patience, min_lr=config.min_lr, verbose=True)
+    
+    history = {'train': {k: [] for k in ['total', 'multi_res', 'recon', 'gompsnr', 'sisnr']},
+               'valid': {k: [] for k in ['total', 'multi_res', 'recon', 'gompsnr', 'sisnr']}}
+    
+    best_loss = float('inf')
+    best_checkpoint_path = None
+    last_checkpoint_path = None
+    
+    # 5. Training Loop
+    print("\nStart Training...")
+    for epoch in range(1, config.epochs + 1):
+        start_t = time.time()
         
-        # Update History & Plot
+        train_res = train_one_epoch(models, criterions, optimizer, train_loader, config, device, epoch)
+        valid_res = validate(models, criterions, valid_loader, config, device)
+
+        # 更新历史并绘图
         for k in history['train']:
-            history['train'][k].append(train_metrics[k])
-            history['valid'][k].append(valid_metrics[k])
+            history['train'][k].append(train_res[k])
+            history['valid'][k].append(valid_res[k])
         plot_history(history, image_dir)
         
-        end_time = time.time()
-        print(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-              f"Epoch {epoch} Done ({end_time - start_time:.1f}s) | "
-              f"Train: {train_metrics['total']:.5f} | "
-              f"Valid: {valid_metrics['total']:.5f}")
+        scheduler.step(valid_res['total'])
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Epoch {epoch} | LR: {current_lr:.2e} | Train: {train_res['total']:.5f} | Valid: {valid_res['total']:.5f} | Time: {time.time()-start_t:.1f}s")
         
-        # ---------------- Saving Logic ----------------
-        current_val_loss = valid_metrics['total']
-        is_best = current_val_loss < best_loss
-        
+        # 滚动保存逻辑
         save_dict = {
-            'epoch': epoch,
-            'encoder': encoder.state_dict(),
-            'decoder': decoder.state_dict(),
-            'loss_multi': crit_multi.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'history': history,
-            'best_loss': best_loss if not is_best else current_val_loss
+            'epoch': epoch, 'history': history, 'best_loss': best_loss,
+            'encoder': encoder.state_dict(), 'decoder': decoder.state_dict(), 
+            'loss_multi': crit_multi.state_dict(), 'scheduler': scheduler.state_dict(),
         }
         
-        # 1. 保存当前轮次模型
-        current_path = os.path.join(exp_dir, f"{epoch}epoch.pth")
+        # A. 保存当前
+        current_path = os.path.join(config.exp_dir, f"{epoch}epoch.pth")
         torch.save(save_dict, current_path)
         
-        # 2. 删除上一轮的普通模型 (如果它不是历史最佳)
+        # B. 删除上一个（非最佳）
         if last_checkpoint_path and last_checkpoint_path != best_checkpoint_path:
-            if os.path.exists(last_checkpoint_path):
-                os.remove(last_checkpoint_path)
-        
-        # 更新 Last 指针
+            if os.path.exists(last_checkpoint_path): os.remove(last_checkpoint_path)
         last_checkpoint_path = current_path
         
-        # 3. 处理最佳模型
-        if is_best:
-            print(f"  >>> New Best! Loss: {best_loss:.5f} -> {current_val_loss:.5f}")
+        # C. 更新最佳
+        if valid_res['total'] < best_loss:
+            print(f"  >>> New Best! Valid Loss: {best_loss:.5f} -> {valid_res['total']:.5f}")
             if best_checkpoint_path and os.path.exists(best_checkpoint_path) and best_checkpoint_path != current_path:
                 os.remove(best_checkpoint_path)
-            best_loss = current_val_loss
+            best_loss = valid_res['total']
             best_checkpoint_path = current_path
             
         print("-" * 60)
 
-    # 7. Finalize
+    # 6. Finalize
     if best_checkpoint_path and os.path.exists(best_checkpoint_path):
-        final_best_path = os.path.join(exp_dir, "best_valid_loss.pth")
-        shutil.copy(best_checkpoint_path, final_best_path)
-        print(f"Training Finished. Best model copied to: {final_best_path}")
-    else:
-        print("Training Finished. (No best model found?)")
+        shutil.copy(best_checkpoint_path, os.path.join(config.exp_dir, "best_valid_loss.pth"))
+    print("Training Completed.")
 
 if __name__ == "__main__":
     main()
