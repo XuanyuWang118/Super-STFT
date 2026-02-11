@@ -57,7 +57,6 @@ class STFTConfig:
                 cfg_dict = yaml.safe_load(f)
         
         if cfg_dict is None:
-            # 默认兜底配置，防止空初始化报错
             cfg_dict = {
                 'audio': {'sample_rate': 16000},
                 'stft': {'target_resolutions': [(64, 32), (32, 16), (16, 8), (8, 4), (4, 2), (2, 1)], 'super_hop_ms': 1.0},
@@ -80,24 +79,40 @@ class STFTConfig:
 
         # 4. Loss Params
         loss_cfg = cfg_dict.get('loss', {})
-        self.multi_res_weight = loss_cfg.get('multi_res_weight', 1.0)
-        
-        # Resolution weights logic
-        res_weights = loss_cfg.get('resolution_weights', [])
-        if not res_weights:
-            self.resolution_weights = [1.0] * len(self.target_resolutions)
-        else:
-            self.resolution_weights = res_weights
-            assert len(self.resolution_weights) == len(self.target_resolutions), "Resolution weights length mismatch"
 
-        self.recon_weight = loss_cfg.get('recon_weight', 1.0)
-        self.sisnr_weight = loss_cfg.get('sisnr_weight', 1.0)
+        # (1) Multi-Resolution Consistency Loss Weights
+        multi_res_weight = loss_cfg.get('multi_res_weight', {})
+        self.multi_res_weight = multi_res_weight.get('weight', 1.0)
+
+        r_w = multi_res_weight.get('real_weight', 1.0)
+        i_w = multi_res_weight.get('imag_weight', 1.0)
+        m_w = multi_res_weight.get('mag_weight', 1.0)
+        w_sum = r_w + i_w + m_w + 1e-8
+        self.real_weight = r_w / w_sum
+        self.imag_weight = i_w / w_sum
+        self.mag_weight = m_w / w_sum
+
+        res_weights = multi_res_weight.get('resolution_weights', [])
+        if res_weights and len(res_weights) == len(self.target_resolutions):
+            total = sum(res_weights) + 1e-8
+            self.resolution_weights = [w / total for w in res_weights]
+        else:
+            self.resolution_weights = [1.0 / len(self.target_resolutions)] * len(self.target_resolutions)
+
+        # (2) GOMPSNR Loss Weights 
         gompsnr_weight = loss_cfg.get('gompsnr_weight', {})
         self.gompsnr_weight = gompsnr_weight.get('weight', 1.0)
-        self.wop_weight = gompsnr_weight.get('wop_weight', 1.0)
-        self.cori_weight = gompsnr_weight.get('cori_weight', 1.0)
+        w_w = gompsnr_weight.get('wop_weight', 1.0)
+        c_w = gompsnr_weight.get('cori_weight', 1.0)
+        w_sum_g = w_w + c_w + 1e-8
+        self.wop_weight = w_w / w_sum_g
+        self.cori_weight = c_w / w_sum_g
         self.wop_alpha = gompsnr_weight.get('wop_alpha', 100)
         self.mag_dist_type = gompsnr_weight.get('mag_dist_type', 'L1')
+
+        # (3) Reconstruction Loss Weight
+        self.recon_weight = loss_cfg.get('recon_weight', 1.0)
+        self.sisnr_weight = loss_cfg.get('sisnr_weight', 1.0)
 
         # 5. Derived Params (Calculated)
         self.max_win_ms = max([r[0] for r in self.target_resolutions])
@@ -108,10 +123,12 @@ class STFTConfig:
             self.base_win_len += 1
 
     def __repr__(self):
-        return (f"<STFTConfig SR={self.sr}, "
-                f"BaseWin={self.base_win_len}({self.max_win_ms}ms), "
-                f"BaseHop={self.base_hop_len}({self.super_hop_ms}ms), "
-                f"Targets={len(self.target_resolutions)} configs>")
+        return (f"STFTConfig(sr={self.sr}, target_resolutions={self.target_resolutions}, "
+                f"super_hop_ms={self.super_hop_ms}, encoder_init='{self.encoder_init}', decoder_init='{self.decoder_init}', "
+                f"multi_res_weight={self.multi_res_weight}, resolution_weights={self.resolution_weights}, "
+                f"real_weight={self.real_weight}, imag_weight={self.imag_weight}, mag_weight={self.mag_weight}, "
+                f"gompsnr_weight={self.gompsnr_weight}, wop_weight={self.wop_weight}, cori_weight={self.cori_weight}, wop_alpha={self.wop_alpha}, mag_dist_type='{self.mag_dist_type}', "
+                f"recon_weight={self.recon_weight}, sisnr_weight={self.sisnr_weight}, base_win_len={self.base_win_len}, base_hop_len={self.base_hop_len})")
 
 
 class SuperResEncoder(nn.Module):
@@ -301,7 +318,7 @@ class MultiResConsistencyLoss(nn.Module):
             gt_mag = torch.clamp(gt_mag, min=1e-6)
             loss_mag = F.mse_loss(torch.log(pred_mag), torch.log(gt_mag))
             
-            current_total_loss = loss_real + loss_imag + loss_mag
+            current_total_loss = loss_real * self.config.real_weight + loss_imag * self.config.imag_weight + loss_mag * self.config.mag_weight
             current_total_loss = current_total_loss * self.config.resolution_weights[i]
             
             total_loss += current_total_loss
