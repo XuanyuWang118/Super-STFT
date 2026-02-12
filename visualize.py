@@ -1,3 +1,4 @@
+from math import exp
 import os
 import yaml
 import torch
@@ -68,7 +69,7 @@ def main():
     
     # Paths
     exp_dir = train_cfg['exp_dir']
-    model_path = os.path.join(exp_dir, "best.pth")
+    model_path = os.path.join(exp_dir, "best_valid_loss.pth")
     save_dir = os.path.join(exp_dir, "image")
     os.makedirs(save_dir, exist_ok=True)
     
