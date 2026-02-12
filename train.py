@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import shutil
 import yaml
 import random
@@ -254,10 +255,53 @@ def main():
     best_loss = float('inf')
     best_checkpoint_path = None
     last_checkpoint_path = None
-    
+
+    # 断点续传
+    start_epoch = 1
+    ckpt_list = [f for f in os.listdir(config.exp_dir) if f.endswith('epoch.pth')]
+    if ckpt_list:
+        # 排序找到最新的 epoch
+        ckpt_list.sort(key=lambda f: int(re.findall(r'\d+', f)[0]))
+        last_ckpt_name = ckpt_list[-1]
+        # 统一使用绝对路径
+        resume_path = os.path.abspath(os.path.join(config.exp_dir, last_ckpt_name))
+        
+        print(f"Resuming from checkpoint: {resume_path}")
+        checkpoint = torch.load(resume_path, map_location=device)
+        
+        # 恢复权重和状态
+        encoder.load_state_dict(checkpoint['encoder'])
+        decoder.load_state_dict(checkpoint['decoder'])
+        crit_multi.load_state_dict(checkpoint['loss_multi'])
+        if 'optimizer' in checkpoint: optimizer.load_state_dict(checkpoint['optimizer'])
+        if 'scheduler' in checkpoint: scheduler.load_state_dict(checkpoint['scheduler'])
+
+        if 'optimizer' in checkpoint: print("Optimizer state loaded.")
+        if 'scheduler' in checkpoint: print("Scheduler state loaded.")
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"DEBUG: Resumed with Learning Rate: {current_lr}")
+        
+        start_epoch = checkpoint['epoch'] + 1
+        history = checkpoint['history']
+        best_loss = checkpoint['best_loss']
+        
+        # 【核心修复】恢复路径指针并标准化
+        last_checkpoint_path = resume_path
+        saved_best_path = checkpoint.get('best_checkpoint_path')
+        
+        if saved_best_path:
+            best_checkpoint_path = os.path.abspath(saved_best_path)
+        else:
+            # 如果是首次升级代码恢复，且当前文件就是最好的（通过 loss 判断）
+            # 或者猜测第一个文件是最好的（之前的旧逻辑）
+            if len(ckpt_list) > 0:
+                best_checkpoint_path = os.path.abspath(os.path.join(config.exp_dir, ckpt_list[0]))
+        
+        print(f"Verified Pointers: Last -> {os.path.basename(last_checkpoint_path)}, Best -> {os.path.basename(best_checkpoint_path)}")
+        
     # 5. Training Loop
     print("\nStart Training...")
-    for epoch in range(1, config.epochs + 1):
+    for epoch in range(start_epoch, config.epochs + 1):
         start_t = time.time()
         
         train_res = train_one_epoch(models, criterions, optimizer, train_loader, config, device, epoch)
@@ -273,29 +317,40 @@ def main():
         current_lr = optimizer.param_groups[0]['lr']
         print(f"Epoch {epoch} | LR: {current_lr:.2e} | Train: {train_res['total']:.5f} | Valid: {valid_res['total']:.5f} | Time: {time.time()-start_t:.1f}s")
         
-        # 滚动保存逻辑
+        current_path = os.path.abspath(os.path.join(config.exp_dir, f"{epoch}epoch.pth"))
+        
+        # 情况 A 的删除逻辑：如果上一轮不是最优，则删除
+        # 使用 os.path.samefile (更安全) 或标准化路径比较
+        if last_checkpoint_path and last_checkpoint_path != best_checkpoint_path:
+            if os.path.exists(last_checkpoint_path):
+                print(f"  >>> Removing old latest: {os.path.basename(last_checkpoint_path)}")
+                os.remove(last_checkpoint_path)
+        
+        # 更新 Last 指针
+        last_checkpoint_path = current_path
+        
+        # 情况 B 的更新逻辑
+        is_new_best = False
+        if valid_res['total'] < best_loss:
+            print(f"  >>> New Best! Valid Loss: {best_loss:.5f} -> {valid_res['total']:.5f}")
+            # 如果之前的 best 不是刚才被作为 last 删掉的文件，现在手动删除它
+            if best_checkpoint_path and os.path.exists(best_checkpoint_path) and best_checkpoint_path != current_path:
+                print(f"  >>> Removing old best: {os.path.basename(best_checkpoint_path)}")
+                os.remove(best_checkpoint_path)
+            
+            best_loss = valid_res['total']
+            best_checkpoint_path = current_path
+            is_new_best = True
+
+        # 保存当前模型
         save_dict = {
             'epoch': epoch, 'history': history, 'best_loss': best_loss,
             'encoder': encoder.state_dict(), 'decoder': decoder.state_dict(), 
-            'loss_multi': crit_multi.state_dict(), 'scheduler': scheduler.state_dict(),
+            'loss_multi': crit_multi.state_dict(), 'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'best_checkpoint_path': best_checkpoint_path, # 保存绝对路径
         }
-        
-        # A. 保存当前
-        current_path = os.path.join(config.exp_dir, f"{epoch}epoch.pth")
         torch.save(save_dict, current_path)
-        
-        # B. 删除上一个（非最佳）
-        if last_checkpoint_path and last_checkpoint_path != best_checkpoint_path:
-            if os.path.exists(last_checkpoint_path): os.remove(last_checkpoint_path)
-        last_checkpoint_path = current_path
-        
-        # C. 更新最佳
-        if valid_res['total'] < best_loss:
-            print(f"  >>> New Best! Valid Loss: {best_loss:.5f} -> {valid_res['total']:.5f}")
-            if best_checkpoint_path and os.path.exists(best_checkpoint_path) and best_checkpoint_path != current_path:
-                os.remove(best_checkpoint_path)
-            best_loss = valid_res['total']
-            best_checkpoint_path = current_path
             
         print("-" * 60)
 
