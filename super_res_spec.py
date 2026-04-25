@@ -79,6 +79,8 @@ class STFTConfig:
         # 4. Loss Params
         loss_cfg = cfg_dict.get('loss', {})
 
+        self.mask_type = loss_cfg.get('mask_type', '2_extreme')
+
         # (1) Multi-Resolution Consistency Loss Weights
         multi_res_weight = loss_cfg.get('multi_res_weight', {})
         self.multi_res_weight = multi_res_weight.get('weight', 1.0)
@@ -271,94 +273,74 @@ class MultiResConsistencyLoss(nn.Module):
         base_hop_len = self.config.base_hop_len
 
         # =====================================================================
-        # 【新增 1】：构建全局交集掩码 (Global Intersection Mask)
+        # Control Variable: 'none', '2_extreme', or '6_all'
+        # Defaulting to '2_extreme' if not explicitly set in config
         # =====================================================================
-        # with torch.no_grad():
-        #     num_res = len(self.config.target_resolutions)
-        #     mask_product = None 
-            
-        #     for win_ms, hop_ms in self.config.target_resolutions:
-        #         n_fft_curr = int(self.config.sr * win_ms / 1000)
-                
-        #         # 计算当前分辨率的 STFT，强行使用 1ms hop 保证时间轴长度对齐
-        #         stft_curr = torch.stft(
-        #             raw_audio.squeeze(1), 
-        #             n_fft=n_fft_curr, 
-        #             hop_length=base_hop_len, 
-        #             win_length=n_fft_curr,
-        #             window=torch.hann_window(n_fft_curr).to(device), 
-        #             center=True, 
-        #             return_complex=True
-        #         )
-        #         mag_curr = torch.abs(stft_curr) # (B, F_curr, T_base)
-                
-        #         # 将低频分辨率拉伸到高频网格 (使用三角核的转置)
-        #         if base_win_len > n_fft_curr:
-        #             key_freq = f"mat_{win_ms}_{hop_ms}"
-        #             W_curr = getattr(self, key_freq) # (F_curr, F_base)
-        #             # bot: (Batch, F_curr, Time), oi: (F_curr, F_base) -> bit: (Batch, F_base, Time)
-        #             mag_proj = torch.einsum('bot,oi->bit', mag_curr, W_curr) 
-        #         else:
-        #             mag_proj = mag_curr
-                
-        #         # 连乘 (加极小值防止0吞噬一切)
-        #         if mask_product is None:
-        #             mask_product = mag_proj + 1e-8
-        #         else:
-        #             mask_product = mask_product * (mag_proj + 1e-8)
-            
-        #     # 计算几何平均，得到交集能量图
-        #     global_mask = torch.pow(mask_product, 1.0 / num_res)
-            
-        #     # 归一化到 [0, 1] 范围
-        #     max_val, _ = global_mask.flatten(1).max(dim=1)
-        #     global_mask = global_mask / (max_val.view(-1, 1, 1) + 1e-8)
-            
-        #     # 设置底噪权重 0.05，防止完全失去约束
-        #     global_mask = torch.clamp(global_mask, min=0.05)
+        mask_type = getattr(self.config, 'mask_type', '2_extreme')
+        global_mask = None
+
+        if mask_type != 'none':
+            with torch.no_grad():
+                if mask_type == '6_all':
+                    # [Method 1] 6-Resolution Intersection Mask
+                    num_res = len(self.config.target_resolutions)
+                    mask_product = None 
+                    for win_ms, hop_ms in self.config.target_resolutions:
+                        n_fft_curr = int(self.config.sr * win_ms / 1000)
+                        stft_curr = torch.stft(
+                            raw_audio.squeeze(1), n_fft=n_fft_curr, hop_length=base_hop_len, 
+                            win_length=n_fft_curr, window=torch.hann_window(n_fft_curr).to(device), 
+                            center=True, return_complex=True
+                        )
+                        mag_curr = torch.abs(stft_curr)
+                        if base_win_len > n_fft_curr:
+                            key_freq = f"mat_{win_ms}_{hop_ms}"
+                            W_curr = getattr(self, key_freq)
+                            mag_proj = torch.einsum('bot,oi->bit', mag_curr, W_curr) 
+                        else:
+                            mag_proj = mag_curr
+                        
+                        if mask_product is None:
+                            mask_product = mag_proj + 1e-8
+                        else:
+                            mask_product = mask_product * (mag_proj + 1e-8)
+                            
+                    global_mask = torch.pow(mask_product, 1.0 / num_res)
+
+                elif mask_type == '2_extreme':
+                    # [Method 2] 2-Extreme Mask (Max Win & Min Win)
+                    max_win_ms, max_hop_ms = self.config.target_resolutions[0]
+                    min_win_ms, min_hop_ms = self.config.target_resolutions[-1]
+                    
+                    n_fft_long = int(self.config.sr * max_win_ms / 1000)
+                    stft_long = torch.stft(
+                        raw_audio.squeeze(1), n_fft=n_fft_long, hop_length=base_hop_len, win_length=n_fft_long,
+                        window=torch.hann_window(n_fft_long).to(device), center=True, return_complex=True
+                    )
+                    mag_long = torch.abs(stft_long)
+                    
+                    n_fft_short = int(self.config.sr * min_win_ms / 1000)
+                    stft_short = torch.stft(
+                        raw_audio.squeeze(1), n_fft=n_fft_short, hop_length=base_hop_len, win_length=n_fft_short,
+                        window=torch.hann_window(n_fft_short).to(device), center=True, return_complex=True
+                    )
+                    mag_short = torch.abs(stft_short)
+                    
+                    key_freq = f"mat_{min_win_ms}_{min_hop_ms}"
+                    W_short = getattr(self, key_freq)
+                    mag_short_proj = torch.einsum('bot,oi->bit', mag_short, W_short) 
+                    
+                    global_mask = torch.sqrt(mag_long * mag_short_proj + 1e-8)
+
+                # Normalize and apply clamp for both mask types
+                max_val, _ = global_mask.flatten(1).max(dim=1)
+                global_mask = global_mask / (max_val.view(-1, 1, 1) + 1e-8)
+                global_mask = torch.clamp(global_mask, min=0.05)
+            # print(f"Global Mask Created with type '{mask_type}' and shape {global_mask.shape}")
         # =====================================================================
-        
-        # =====================================================================
-        # 【新增 1 修改】：退回 2-Extreme Mask，保护瞬态竖线不被过度稀释
-        # =====================================================================
-        with torch.no_grad():
-            # 只取两端：最长窗 (提供横线) 和 最短窗 (提供竖线)
-            max_win_ms, max_hop_ms = self.config.target_resolutions[0]
-            min_win_ms, min_hop_ms = self.config.target_resolutions[-1]
-            
-            # 1. 算长窗 (横线图)
-            n_fft_long = int(self.config.sr * max_win_ms / 1000)
-            stft_long = torch.stft(
-                raw_audio.squeeze(1), n_fft=n_fft_long, hop_length=base_hop_len, win_length=n_fft_long,
-                window=torch.hann_window(n_fft_long).to(device), center=True, return_complex=True
-            )
-            mag_long = torch.abs(stft_long)
-            
-            # 2. 算短窗 (竖线图)
-            n_fft_short = int(self.config.sr * min_win_ms / 1000)
-            stft_short = torch.stft(
-                raw_audio.squeeze(1), n_fft=n_fft_short, hop_length=base_hop_len, win_length=n_fft_short,
-                window=torch.hann_window(n_fft_short).to(device), center=True, return_complex=True
-            )
-            mag_short = torch.abs(stft_short)
-            
-            # 3. 投影短窗到高频网格
-            key_freq = f"mat_{min_win_ms}_{min_hop_ms}"
-            W_short = getattr(self, key_freq)
-            mag_short_proj = torch.einsum('bot,oi->bit', mag_short, W_short) 
-            
-            # 4. 仅这两端求几何平均！(横线 * 竖线)
-            global_mask = torch.sqrt(mag_long * mag_short_proj + 1e-8)
-            
-            # 5. 归一化与保底
-            max_val, _ = global_mask.flatten(1).max(dim=1)
-            global_mask = global_mask / (max_val.view(-1, 1, 1) + 1e-8)
-            global_mask = torch.clamp(global_mask, min=0.05)
-        # =============================================================================
-        # print(f"\n[Loss Debug] Global Mask Shape: {global_mask.shape}, Max Value: {global_mask.max().item():.4f}, Min Value: {global_mask.min().item():.4f}")
 
         if verbose:
-            print(f"\n[Loss Debug] Base Complex Shape: {pred_super_complex.shape}")
+            print(f"\n[Loss Debug] Base Complex Shape: {pred_super_complex.shape}, Mask Type: {mask_type}")
 
         for i, (win_ms, hop_ms) in enumerate(self.config.target_resolutions):
             target_win_len = int(self.config.sr * win_ms / 1000)
@@ -377,7 +359,7 @@ class MultiResConsistencyLoss(nn.Module):
             gt_view = torch.view_as_real(gt_complex_tensor) 
             
             curr_pred = pred_super_complex
-            curr_mask = global_mask # 取出该分辨率对应的初始 Mask
+            curr_mask = global_mask 
             
             # 2. Freq Downsampling
             if base_win_len > target_win_len:
@@ -385,15 +367,14 @@ class MultiResConsistencyLoss(nn.Module):
                 W = getattr(self, key_freq)
                 curr_pred = torch.einsum('bitc,oi->botc', curr_pred, W)
                 
-                # 【新增 2】：对 Mask 进行频率下采样 (线性加权)
-                curr_mask = torch.einsum('bit,oi->bot', curr_mask, W)
+                if curr_mask is not None:
+                    curr_mask = torch.einsum('bit,oi->bot', curr_mask, W)
 
             # 3. Time Downsampling
             time_factor = target_hop_len // base_hop_len
             time_factor = max(1, time_factor)
             
             if time_factor > 1:
-                # --- Pred 的复数下采样 ---
                 curr_pred_complex = torch.view_as_complex(curr_pred.contiguous())
                 B, n_freq, n_time = curr_pred_complex.shape
                 
@@ -401,9 +382,8 @@ class MultiResConsistencyLoss(nn.Module):
                 if remainder != 0:
                     pad_amount = time_factor - remainder
                     curr_pred_complex = F.pad(curr_pred_complex, (0, pad_amount), mode='constant', value=0)
-                    
-                    # 【新增 3】：对 Mask 进行相同的时间 Pad (用 0.05 补齐)
-                    curr_mask = F.pad(curr_mask, (0, pad_amount), mode='constant', value=0.05)
+                    if curr_mask is not None:
+                        curr_mask = F.pad(curr_mask, (0, pad_amount), mode='constant', value=0.05)
 
                 n_time_padded = curr_pred_complex.shape[-1]
                 n_blocks = n_time_padded // time_factor
@@ -412,7 +392,6 @@ class MultiResConsistencyLoss(nn.Module):
                 
                 freqs = torch.fft.rfftfreq(target_win_len, d=1.0/self.config.sr).to(device)
                 t_indices = torch.arange(time_factor).to(device)
-                
                 base_hop_sec = base_hop_len / self.config.sr
                 theta = -2 * torch.pi * freqs.unsqueeze(1) * t_indices.unsqueeze(0) * base_hop_sec 
                 
@@ -423,43 +402,40 @@ class MultiResConsistencyLoss(nn.Module):
                 curr_pred_reduced = weighted_spec.mean(dim=3)
                 curr_pred = torch.view_as_real(curr_pred_reduced)
                 
-                # --- 【新增 4】：对 Mask 的标量下采样 (直接均值池化) ---
-                curr_mask_unfolded = curr_mask.view(B, n_freq, n_blocks, time_factor)
-                curr_mask = curr_mask_unfolded.mean(dim=3)
+                if curr_mask is not None:
+                    curr_mask_unfolded = curr_mask.view(B, n_freq, n_blocks, time_factor)
+                    curr_mask = curr_mask_unfolded.mean(dim=3)
                 
-            # 4. Loss
+            # 4. Loss Mask Assignment
             assert curr_pred.shape == gt_view.shape, f"Shape mismatch: Pred {curr_pred.shape}, GT {gt_view.shape}"
             min_f = min(curr_pred.shape[1], gt_view.shape[1])
             min_t = min(curr_pred.shape[2], gt_view.shape[2])
             
             pred_crop = curr_pred[:, :min_f, :min_t, :]
             gt_crop = gt_view[:, :min_f, :min_t, :]
-            mask_crop = curr_mask[:, :min_f, :min_t] # (B, F, T)
-            # print(f"\n[Loss Debug] Pred Crop Shape: {pred_crop.shape}, GT Crop Shape: {gt_crop.shape}, Mask Crop Shape: {mask_crop.shape}")
             
-            # 【新增 5】：加权 MSE 误差计算
-            # 为保证总 Loss 尺度平衡，将 Mask 均值拉回到 1.0
-            mask_crop = mask_crop / (mask_crop.mean() + 1e-8)
-            mask_crop_unsqueeze = mask_crop.unsqueeze(-1) # 适应 Real/Imag 的最后一维
+            if curr_mask is not None:
+                mask_crop = curr_mask[:, :min_f, :min_t]
+                mask_crop = mask_crop / (mask_crop.mean() + 1e-8)
+            else:
+                mask_crop = 1.0 # Broadcasting allows seamless unweighted operation
+            # print(f"  [{i}] Pred Crop Shape: {pred_crop.shape}, GT Crop Shape: {gt_crop.shape}, Mask Crop Shape: {mask_crop.shape if torch.is_tensor(mask_crop) else 'Scalar'}")
             
-            # Real
+            # 5. Loss Calculation
             loss_real_unreduced = F.mse_loss(pred_crop[..., 0], gt_crop[..., 0], reduction='none')
             loss_real = (loss_real_unreduced * mask_crop).mean()
             
-            # Imag
             loss_imag_unreduced = F.mse_loss(pred_crop[..., 1], gt_crop[..., 1], reduction='none')
             loss_imag = (loss_imag_unreduced * mask_crop).mean()
             
-            # Mag
             pred_mag = torch.norm(pred_crop, dim=-1)
             gt_mag = torch.norm(gt_crop, dim=-1)
             pred_mag = torch.clamp(pred_mag, min=1e-6)
             gt_mag = torch.clamp(gt_mag, min=1e-6)
-            
+
             loss_mag_unreduced = F.mse_loss(torch.log(pred_mag), torch.log(gt_mag), reduction='none')
             loss_mag = (loss_mag_unreduced * mask_crop).mean()
             
-            # 权重结合
             current_total_loss = loss_real * self.config.real_weight + loss_imag * self.config.imag_weight + loss_mag * self.config.mag_weight
             current_total_loss = current_total_loss * self.config.resolution_weights[i]
             
@@ -476,6 +452,7 @@ class MultiResConsistencyLoss(nn.Module):
                 print(f"   -> Sum:           {current_total_loss.item():.5f}")
 
         return total_loss, details
+
 
 class GOMPSNRLoss(nn.Module):
     def __init__(self, config: STFTConfig):
