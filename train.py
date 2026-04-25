@@ -20,7 +20,9 @@ from super_res_spec import (
     SuperResDecoder, 
     MultiResConsistencyLoss, 
     GOMPSNRLoss, 
-    SISNRLoss
+    SISNRLoss,
+    compute_entropy_loss,
+    compute_tv_loss
 )
 
 class TeeLogger(object):
@@ -98,10 +100,11 @@ def set_seed(seed):
 def plot_history(history, save_dir):
     os.makedirs(save_dir, exist_ok=True)
     plt.rcParams['font.family'] = 'sans-serif'
-    metrics = ['total', 'multi_res', 'recon', 'gompsnr', 'sisnr']
-    plt.figure(figsize=(15, 12))
+    metrics = ['total', 'multi_res', 'recon', 'gompsnr', 'sisnr', 'entropy', 'tv']
+    plt.figure(figsize=(15, 4 * ((len(metrics)+1)//2)))
+    nrows = (len(metrics) + 1) // 2
     for i, metric in enumerate(metrics):
-        plt.subplot(3, 2, i+1)
+        plt.subplot(nrows, 2, i+1)
         train_vals = history['train'].get(metric, [])
         valid_vals = history['valid'].get(metric, [])
         epochs = range(1, len(train_vals) + 1)
@@ -120,7 +123,7 @@ def train_one_epoch(models, criterions, optimizer, dataloader, config, device, e
     crit_multi, crit_gompsnr, crit_sisnr = criterions['multi'], criterions['gompsnr'], criterions['sisnr']
     
     encoder.train(); decoder.train(); crit_multi.train() 
-    loss_meter = {k: 0.0 for k in ['total', 'multi_res', 'recon', 'gompsnr', 'sisnr']}
+    loss_meter = {k: 0.0 for k in ['total', 'multi_res', 'recon', 'gompsnr', 'sisnr', 'entropy', 'tv']}
     
     for batch_idx, x in enumerate(dataloader):
         x = x.to(device)
@@ -128,6 +131,9 @@ def train_one_epoch(models, criterions, optimizer, dataloader, config, device, e
         
         z_complex = encoder(x)
         x_recon = decoder(z_complex)
+        # 新增：entropy 和 tv 在 encoder 输出的复数特征上计算
+        entropy_loss_raw = compute_entropy_loss(z_complex)
+        tv_loss_raw = compute_tv_loss(z_complex)
         
         # 计算原始 Loss
         multi_loss_raw, _ = crit_multi(z_complex, x)
@@ -139,7 +145,9 @@ def train_one_epoch(models, criterions, optimizer, dataloader, config, device, e
         loss_total = (multi_loss_raw * config.multi_res_weight + 
                       recon_loss_raw * config.recon_weight + 
                       gompsnr_loss_raw * config.gompsnr_weight +
-                      sisnr_loss_raw * config.sisnr_weight)
+                      sisnr_loss_raw * config.sisnr_weight +
+                      entropy_loss_raw * config.entropy_weight +
+                      tv_loss_raw * config.tv_weight)
         
         loss_total.backward()
         clip_grad_norm_(list(encoder.parameters())+list(decoder.parameters())+list(crit_multi.parameters()), config.grad_clip)
@@ -151,10 +159,12 @@ def train_one_epoch(models, criterions, optimizer, dataloader, config, device, e
         loss_meter['recon'] += recon_loss_raw.item()
         loss_meter['gompsnr'] += gompsnr_loss_raw.item()
         loss_meter['sisnr'] += sisnr_loss_raw.item()
+        loss_meter['entropy'] += entropy_loss_raw.item()
+        loss_meter['tv'] += tv_loss_raw.item()
         
         if batch_idx % config.log_interval == 0:
             print(f"Epoch: {epoch} [{batch_idx}/{len(dataloader)}] Loss: {loss_total.item():.4f} "
-                  f"(M:{multi_loss_raw.item():.2f} R:{recon_loss_raw.item():.2f} G:{gompsnr_loss_raw.item():.2f} S:{sisnr_loss_raw.item():.2f})")
+                  f"(M:{multi_loss_raw.item():.2f} R:{recon_loss_raw.item():.2f} G:{gompsnr_loss_raw.item():.2f} S:{sisnr_loss_raw.item():.2f} E:{entropy_loss_raw.item():.2f} T:{tv_loss_raw.item():.2f})")
             
     return {k: v / len(dataloader) for k, v in loss_meter.items()}
 
@@ -164,28 +174,34 @@ def validate(models, criterions, dataloader, config, device):
     crit_multi, crit_gompsnr, crit_sisnr = criterions['multi'], criterions['gompsnr'], criterions['sisnr']
     encoder.eval(); decoder.eval(); crit_multi.eval()
     
-    loss_meter = {k: 0.0 for k in ['total', 'multi_res', 'recon', 'gompsnr', 'sisnr']}
+    loss_meter = {k: 0.0 for k in ['total', 'multi_res', 'recon', 'gompsnr', 'sisnr', 'entropy', 'tv']}
     with torch.no_grad():
         for x in dataloader:
             x = x.to(device)
             z_complex = encoder(x)
             x_recon = decoder(z_complex)
-            
+            entropy_loss_raw = compute_entropy_loss(z_complex)
+            tv_loss_raw = compute_tv_loss(z_complex)
+
             multi_loss_raw, _ = crit_multi(z_complex, x)
             recon_loss_raw = F.mse_loss(x, x_recon)
             gompsnr_loss_raw, _ = crit_gompsnr(x_recon, x)
             sisnr_loss_raw = crit_sisnr(x_recon, x)
-            
+
             loss_total = (multi_loss_raw * config.multi_res_weight + 
                           recon_loss_raw * config.recon_weight + 
                           gompsnr_loss_raw * config.gompsnr_weight +
-                          sisnr_loss_raw * config.sisnr_weight)
+                          sisnr_loss_raw * config.sisnr_weight +
+                          entropy_loss_raw * config.entropy_weight +
+                          tv_loss_raw * config.tv_weight)
             
             loss_meter['total'] += loss_total.item()
             loss_meter['multi_res'] += multi_loss_raw.item()
             loss_meter['recon'] += recon_loss_raw.item()
             loss_meter['gompsnr'] += gompsnr_loss_raw.item()
             loss_meter['sisnr'] += sisnr_loss_raw.item()
+            loss_meter['entropy'] += entropy_loss_raw.item()
+            loss_meter['tv'] += tv_loss_raw.item()
             
     return {k: v / len(dataloader) for k, v in loss_meter.items()}
 
@@ -203,6 +219,9 @@ def main():
         setattr(config, k, v)
     # 将 dataset 字典中的内容也挂载方便使用
     config.dataset = config_dict.get('dataset', {})
+    # 将 audio 配置也挂载为属性，方便数据集使用
+    config.sample_rate = config_dict.get('audio', {}).get('sample_rate', 16000)
+    config.segment_length = config_dict.get('audio', {}).get('segment_length', 1.0)
 
     # 2. 目录准备与日志重定向
     os.makedirs(config.exp_dir, exist_ok=True)
@@ -215,8 +234,13 @@ def main():
     sys.stdout = logger  # 重定向标准输出
     sys.stderr = logger  # 重定向标准错误
 
-    # 备份配置
-    shutil.copy(yaml_path, os.path.join(config.exp_dir, "config.yaml"))
+    # 备份目录，并检查重复配置文件
+    src_config_path = os.path.abspath(yaml_path)
+    dst_config_path = os.path.abspath(os.path.join(config.exp_dir, "config.yaml"))
+
+    if src_config_path != dst_config_path:
+        shutil.copy(yaml_path, dst_config_path)
+    # shutil.copy(yaml_path, os.path.join(config.exp_dir, "config.yaml"))
     
     print("="*100)
     print(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -228,9 +252,15 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # 3. DataLoaders
-    train_loader = DataLoader(VCTKDataset(config.dataset['train_scp'], is_train=True), 
+    train_loader = DataLoader(VCTKDataset(config.dataset['train_scp'],
+                                          sample_rate=config.sample_rate,
+                                          segment_length=config.segment_length,
+                                          is_train=True),
                               batch_size=config.batch_size, shuffle=True, num_workers=config.num_workers)
-    valid_loader = DataLoader(VCTKDataset(config.dataset['valid_scp'], is_train=False), 
+    valid_loader = DataLoader(VCTKDataset(config.dataset['valid_scp'],
+                                          sample_rate=config.sample_rate,
+                                          segment_length=config.segment_length,
+                                          is_train=False),
                               batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers)
     
     # 4. Models & Criterions
@@ -249,8 +279,8 @@ def main():
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=config.lr_factor,
                                                             patience=config.lr_patience, min_lr=config.min_lr, verbose=True)
     
-    history = {'train': {k: [] for k in ['total', 'multi_res', 'recon', 'gompsnr', 'sisnr']},
-               'valid': {k: [] for k in ['total', 'multi_res', 'recon', 'gompsnr', 'sisnr']}}
+    history = {'train': {k: [] for k in ['total', 'multi_res', 'recon', 'gompsnr', 'sisnr', 'entropy', 'tv']},
+               'valid': {k: [] for k in ['total', 'multi_res', 'recon', 'gompsnr', 'sisnr', 'entropy', 'tv']}}
     
     best_loss = float('inf')
     best_checkpoint_path = None
