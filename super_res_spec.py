@@ -335,7 +335,8 @@ class MultiResConsistencyLoss(nn.Module):
                 # Normalize and apply clamp for both mask types
                 max_val, _ = global_mask.flatten(1).max(dim=1)
                 global_mask = global_mask / (max_val.view(-1, 1, 1) + 1e-8)
-                global_mask = torch.clamp(global_mask, min=0.05)
+                # global_mask = torch.clamp(global_mask, min=0.05)
+                global_mask = torch.where(global_mask < 0.05, torch.zeros_like(global_mask), global_mask)
             # print(f"Global Mask Created with type '{mask_type}' and shape {global_mask.shape}")
         # =====================================================================
 
@@ -430,10 +431,16 @@ class MultiResConsistencyLoss(nn.Module):
             
             pred_mag = torch.norm(pred_crop, dim=-1)
             gt_mag = torch.norm(gt_crop, dim=-1)
-            pred_mag = torch.clamp(pred_mag, min=1e-6)
-            gt_mag = torch.clamp(gt_mag, min=1e-6)
-
-            loss_mag_unreduced = F.mse_loss(torch.log(pred_mag), torch.log(gt_mag), reduction='none')
+            # pred_mag = torch.clamp(pred_mag, min=1e-6)
+            # gt_mag = torch.clamp(gt_mag, min=1e-6)
+            # loss_mag_unreduced = F.mse_loss(torch.log(pred_mag), torch.log(gt_mag), reduction='none')
+            # loss_mag = (loss_mag_unreduced * mask_crop).mean()
+            eps_mag = 1e-4
+            pred_mag_safe = torch.clamp(pred_mag, min=eps_mag)
+            gt_mag_safe = torch.clamp(gt_mag, min=eps_mag)
+            loss_mag_log = F.mse_loss(torch.log(pred_mag_safe), torch.log(gt_mag_safe), reduction='none')
+            loss_mag_lin = F.l1_loss(pred_mag, gt_mag, reduction='none')
+            loss_mag_unreduced = loss_mag_log + 10.0 * loss_mag_lin
             loss_mag = (loss_mag_unreduced * mask_crop).mean()
             
             current_total_loss = loss_real * self.config.real_weight + loss_imag * self.config.imag_weight + loss_mag * self.config.mag_weight
