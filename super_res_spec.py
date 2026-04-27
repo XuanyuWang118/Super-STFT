@@ -336,7 +336,7 @@ class MultiResConsistencyLoss(nn.Module):
                 max_val, _ = global_mask.flatten(1).max(dim=1)
                 global_mask = global_mask / (max_val.view(-1, 1, 1) + 1e-8)
                 # global_mask = torch.clamp(global_mask, min=0.05)
-                global_mask = torch.where(global_mask < 0.05, torch.zeros_like(global_mask), global_mask)
+                # global_mask = torch.where(global_mask < 0.05, torch.zeros_like(global_mask), global_mask)
             # print(f"Global Mask Created with type '{mask_type}' and shape {global_mask.shape}")
         # =====================================================================
 
@@ -423,25 +423,57 @@ class MultiResConsistencyLoss(nn.Module):
             # print(f"  [{i}] Pred Crop Shape: {pred_crop.shape}, GT Crop Shape: {gt_crop.shape}, Mask Crop Shape: {mask_crop.shape if torch.is_tensor(mask_crop) else 'Scalar'}")
             
             # 5. Loss Calculation
+            # loss_real_unreduced = F.mse_loss(pred_crop[..., 0], gt_crop[..., 0], reduction='none')
+            # loss_real = (loss_real_unreduced * mask_crop).mean()
+            
+            # loss_imag_unreduced = F.mse_loss(pred_crop[..., 1], gt_crop[..., 1], reduction='none')
+            # loss_imag = (loss_imag_unreduced * mask_crop).mean()
+
+            # # 针对性加权方案：对数损失在低能量区域更敏感，线性损失在高能量区域更敏感。
+            # # 通过 mask_crop 进行加权，重点关注重要区域。
+            # pred_mag = torch.norm(pred_crop, dim=-1)
+            # gt_mag = torch.norm(gt_crop, dim=-1)
+            # pred_mag_safe = torch.clamp(pred_mag, min=1e-4)
+            # gt_mag_safe = torch.clamp(gt_mag, min=1e-4)
+            # loss_mag_log_unreduced = F.mse_loss(torch.log(pred_mag_safe), torch.log(gt_mag_safe), reduction='none')
+            # loss_mag_log = (loss_mag_log_unreduced * mask_crop).mean()
+            # soft_mask = torch.clamp(mask_crop, min=0.05) 
+            # loss_mag_lin_unreduced = F.l1_loss(pred_mag, gt_mag, reduction='none')
+            # loss_mag_lin = (loss_mag_lin_unreduced * soft_mask).mean()
+            # loss_mag = loss_mag_log + 10.0 * loss_mag_lin
+
+            # --- [关键步骤 1]：定义两种掩码 ---
+            # 1. 软掩码：最低 0.05，用于所有线性损失 (Real/Imag/L1-Mag)，解决红色区伪影
+            soft_mask = torch.clamp(mask_crop, min=0.05)
+            # 2. 硬掩码：包含 0，只用于对数损失 (Log-Mag)，解决蓝色区紫斑
+            hard_mask = mask_crop 
+            
+            # 均值归一化，保持 Loss 尺度对齐
+            soft_mask = soft_mask / (soft_mask.mean() + 1e-8)
+            hard_mask = hard_mask / (hard_mask.mean() + 1e-8)
+
+            # --- [关键步骤 2]：Real/Imag 必须改用 soft_mask ---
             loss_real_unreduced = F.mse_loss(pred_crop[..., 0], gt_crop[..., 0], reduction='none')
-            loss_real = (loss_real_unreduced * mask_crop).mean()
+            loss_real = (loss_real_unreduced * soft_mask).mean() # 修改点
             
             loss_imag_unreduced = F.mse_loss(pred_crop[..., 1], gt_crop[..., 1], reduction='none')
-            loss_imag = (loss_imag_unreduced * mask_crop).mean()
+            loss_imag = (loss_imag_unreduced * soft_mask).mean() # 修改点
             
             pred_mag = torch.norm(pred_crop, dim=-1)
             gt_mag = torch.norm(gt_crop, dim=-1)
-            # pred_mag = torch.clamp(pred_mag, min=1e-6)
-            # gt_mag = torch.clamp(gt_mag, min=1e-6)
-            # loss_mag_unreduced = F.mse_loss(torch.log(pred_mag), torch.log(gt_mag), reduction='none')
-            # loss_mag = (loss_mag_unreduced * mask_crop).mean()
+
             eps_mag = 1e-4
             pred_mag_safe = torch.clamp(pred_mag, min=eps_mag)
             gt_mag_safe = torch.clamp(gt_mag, min=eps_mag)
-            loss_mag_log = F.mse_loss(torch.log(pred_mag_safe), torch.log(gt_mag_safe), reduction='none')
-            loss_mag_lin = F.l1_loss(pred_mag, gt_mag, reduction='none')
-            loss_mag_unreduced = loss_mag_log + 10.0 * loss_mag_lin
-            loss_mag = (loss_mag_unreduced * mask_crop).mean()
+            
+            # --- [关键步骤 3]：Log 损失用 hard_mask，线性 Mag 用 soft_mask ---
+            loss_mag_log_unreduced = F.mse_loss(torch.log(pred_mag_safe), torch.log(gt_mag_safe), reduction='none')
+            loss_mag_log = (loss_mag_log_unreduced * hard_mask).mean() # 解决蓝色区
+            
+            loss_mag_lin_unreduced = F.l1_loss(pred_mag, gt_mag, reduction='none')
+            loss_mag_lin = (loss_mag_lin_unreduced * soft_mask).mean() # 解决红色区
+            
+            loss_mag = loss_mag_log + 10.0 * loss_mag_lin
             
             current_total_loss = loss_real * self.config.real_weight + loss_imag * self.config.imag_weight + loss_mag * self.config.mag_weight
             current_total_loss = current_total_loss * self.config.resolution_weights[i]
