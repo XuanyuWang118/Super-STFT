@@ -128,7 +128,7 @@ class STFTConfig:
             self.base_win_len += 1
 
     def __repr__(self):
-        return (f"STFTConfig(sr={self.sr}, target_resolutions={self.target_resolutions}, "
+        return (f"STFTConfig(mask_type='{self.mask_type}', sr={self.sr}, target_resolutions={self.target_resolutions}, "
                 f"super_hop_ms={self.super_hop_ms}, encoder_init='{self.encoder_init}', decoder_init='{self.decoder_init}', "
                 f"multi_res_weight={self.multi_res_weight}, resolution_weights={self.resolution_weights}, "
                 f"real_weight={self.real_weight}, imag_weight={self.imag_weight}, mag_weight={self.mag_weight}, "
@@ -452,6 +452,147 @@ class MultiResConsistencyLoss(nn.Module):
         return total_loss, details
 
 
+class HybridSupervisionLoss(MultiResConsistencyLoss):
+    """
+    Hybrid Supervision paradigm:
+      - Magnitude (Target-Driven):    single loss against the 6-resolution geometric-mean intersection target.
+      - Real/Imag (Consistency-Driven): multi-resolution loop (existing downsampling + mask), magnitude term removed.
+    """
+
+    def forward(self, pred_super_complex, raw_audio, verbose=False):
+        total_loss = 0.0
+        details = {}
+        device = pred_super_complex.device
+
+        base_win_len = self.config.base_win_len
+        base_hop_len = self.config.base_hop_len
+        num_res = len(self.config.target_resolutions)
+
+        # =====================================================================
+        # Step 1: Compute intersection_mag via log-space geometric mean
+        # All STFTs share base_hop_len so T dimension is aligned.
+        # =====================================================================
+        with torch.no_grad():
+            log_sum = None
+            for win_ms, hop_ms in self.config.target_resolutions:
+                n_fft_curr = int(self.config.sr * win_ms / 1000)
+                stft_curr = torch.stft(
+                    raw_audio.squeeze(1), n_fft=n_fft_curr, hop_length=base_hop_len,
+                    win_length=n_fft_curr, window=torch.hann_window(n_fft_curr).to(device),
+                    center=True, return_complex=True
+                )
+                mag_curr = torch.abs(stft_curr)
+                if base_win_len > n_fft_curr:
+                    key_freq = f"mat_{win_ms}_{hop_ms}"
+                    W_curr = getattr(self, key_freq)
+                    mag_proj = torch.einsum('bot,oi->bit', mag_curr, W_curr)
+                else:
+                    mag_proj = mag_curr
+
+                log_mag = torch.log(mag_proj + 1e-8)
+                log_sum = log_mag if log_sum is None else log_sum + log_mag
+
+            intersection_mag = torch.exp(log_sum / num_res)  # (B, F_base, T_base)
+
+            # Derive global_mask from intersection_mag for the consistency loop
+            max_val, _ = intersection_mag.flatten(1).max(dim=1)
+            global_mask = intersection_mag / (max_val.view(-1, 1, 1) + 1e-8)
+            global_mask = torch.clamp(global_mask, min=0.05)
+
+        # =====================================================================
+        # Step 2: Magnitude Target Loss (single, base resolution)
+        # =====================================================================
+        pred_mag = torch.norm(pred_super_complex, dim=-1)  # (B, F_base, T_base)
+        min_f = min(pred_mag.shape[1], intersection_mag.shape[1])
+        min_t = min(pred_mag.shape[2], intersection_mag.shape[2])
+
+        loss_mag_target = F.mse_loss(
+            torch.log1p(pred_mag[:, :min_f, :min_t] * 10.0),
+            torch.log1p(intersection_mag[:, :min_f, :min_t] * 10.0),
+        )
+        total_loss += loss_mag_target * self.config.mag_weight
+        details['mag_target'] = loss_mag_target.item()
+
+        if verbose:
+            print(f"\n[HybridLoss] intersection_mag shape: {intersection_mag.shape}")
+            print(f"  -> Loss Mag Target: {loss_mag_target.item():.5f}")
+
+        # =====================================================================
+        # Step 3: Complex Consistency Loss (real + imag only, no mag term)
+        # Reuses the same downsampling logic as MultiResConsistencyLoss.
+        # =====================================================================
+        for i, (win_ms, hop_ms) in enumerate(self.config.target_resolutions):
+            target_win_len = int(self.config.sr * win_ms / 1000)
+            target_hop_len = int(self.config.sr * hop_ms / 1000)
+
+            gt_complex_tensor = torch.stft(
+                raw_audio.squeeze(1),
+                n_fft=target_win_len, hop_length=target_hop_len,
+                win_length=target_win_len,
+                window=torch.hann_window(target_win_len).to(device),
+                center=True, return_complex=True
+            )
+            gt_view = torch.view_as_real(gt_complex_tensor)
+
+            curr_pred = pred_super_complex
+            curr_mask = global_mask
+
+            # Freq downsampling
+            if base_win_len > target_win_len:
+                key_freq = f"mat_{win_ms}_{hop_ms}"
+                W = getattr(self, key_freq)
+                curr_pred = torch.einsum('bitc,oi->botc', curr_pred, W)
+                curr_mask = torch.einsum('bit,oi->bot', curr_mask, W)
+
+            # Time downsampling
+            time_factor = max(1, target_hop_len // base_hop_len)
+            if time_factor > 1:
+                curr_pred_complex = torch.view_as_complex(curr_pred.contiguous())
+                B, n_freq, n_time = curr_pred_complex.shape
+
+                remainder = n_time % time_factor
+                if remainder != 0:
+                    pad_amount = time_factor - remainder
+                    curr_pred_complex = F.pad(curr_pred_complex, (0, pad_amount), value=0)
+                    curr_mask = F.pad(curr_mask, (0, pad_amount), value=0.05)
+
+                n_blocks = curr_pred_complex.shape[-1] // time_factor
+                curr_pred_unfolded = curr_pred_complex.view(B, n_freq, n_blocks, time_factor)
+
+                freqs = torch.fft.rfftfreq(target_win_len, d=1.0 / self.config.sr).to(device)
+                t_indices = torch.arange(time_factor).to(device)
+                base_hop_sec = base_hop_len / self.config.sr
+                theta = -2 * torch.pi * freqs.unsqueeze(1) * t_indices.unsqueeze(0) * base_hop_sec
+                rot_complex = torch.polar(torch.ones_like(theta), theta)
+                kernel = self.kernel_win[str(time_factor)]
+                weighted_spec = curr_pred_unfolded * rot_complex.unsqueeze(0).unsqueeze(2) * kernel.view(1, 1, 1, -1)
+
+                curr_pred = torch.view_as_real(weighted_spec.mean(dim=3))
+                curr_mask = curr_mask.view(B, n_freq, n_blocks, time_factor).mean(dim=3)
+
+            assert curr_pred.shape == gt_view.shape, f"Shape mismatch: {curr_pred.shape} vs {gt_view.shape}"
+            min_f = min(curr_pred.shape[1], gt_view.shape[1])
+            min_t = min(curr_pred.shape[2], gt_view.shape[2])
+            pred_crop = curr_pred[:, :min_f, :min_t, :]
+            gt_crop = gt_view[:, :min_f, :min_t, :]
+            mask_crop = curr_mask[:, :min_f, :min_t]
+            mask_crop = mask_crop / (mask_crop.mean() + 1e-8)
+
+            loss_real = (F.mse_loss(pred_crop[..., 0], gt_crop[..., 0], reduction='none') * mask_crop).mean()
+            loss_imag = (F.mse_loss(pred_crop[..., 1], gt_crop[..., 1], reduction='none') * mask_crop).mean()
+
+            current_loss = (loss_real * self.config.real_weight + loss_imag * self.config.imag_weight) * self.config.resolution_weights[i]
+            total_loss += current_loss
+            details[f"{win_ms}ms_{hop_ms}ms"] = current_loss.item()
+
+            if verbose:
+                print(f" Target [{i}]: Win={win_ms}ms, Hop={hop_ms}ms, T_factor={time_factor}")
+                print(f"   -> Loss Real: {loss_real.item():.5f}  Loss Imag: {loss_imag.item():.5f}")
+                print(f"   -> Sum: {current_loss.item():.5f}")
+
+        return total_loss, details
+
+
 class GOMPSNRLoss(nn.Module):
     def __init__(self, config: STFTConfig):
         super().__init__()
@@ -578,7 +719,7 @@ if __name__ == "__main__":
     # 2. Models
     encoder = SuperResEncoder(cfg).to(device)
     decoder = SuperResDecoder(cfg).to(device)
-    mrc_loss = MultiResConsistencyLoss(cfg).to(device)
+    mrc_loss = HybridSupervisionLoss(cfg).to(device)
     gompsnr_loss = GOMPSNRLoss(cfg).to(device)
     sisnr_loss = SISNRLoss().to(device)
     
