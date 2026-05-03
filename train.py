@@ -18,7 +18,8 @@ from super_res_spec import (
     STFTConfig, 
     SuperResEncoder, 
     SuperResDecoder, 
-    MultiResConsistencyLoss, 
+    MultiResConsistencyLoss,
+    HybridSupervisionLoss,
     GOMPSNRLoss, 
     SISNRLoss,
     compute_entropy_loss,
@@ -265,8 +266,13 @@ def main():
     
     # 4. Models & Criterions
     encoder = SuperResEncoder(config).to(device)
-    decoder = SuperResDecoder(config).to(device)
-    crit_multi = MultiResConsistencyLoss(config).to(device)
+    decoder = SuperResDecoder(config=config).to(device)
+    if config.mask_type == 'none':
+        crit_multi = HybridSupervisionLoss(config).to(device)
+        print("Using HybridSupervisionLoss based on mask_type='none'")
+    else:
+        crit_multi = MultiResConsistencyLoss(config).to(device)
+        print(f"Using MultiResConsistencyLoss based on mask_type='{config.mask_type}'")
     crit_gompsnr = GOMPSNRLoss(config).to(device)
     crit_sisnr = SISNRLoss().to(device)
     
