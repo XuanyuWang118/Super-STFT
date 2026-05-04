@@ -599,7 +599,7 @@ class HybridSupervisionLoss(MultiResConsistencyLoss):
             torch.log1p(intersection_mag[:, :min_f, :min_t] * 10.0),
         )
         total_loss += loss_mag_target * self.config.mag_weight
-        details['mag_target'] = loss_mag_target.item()
+        details['loss_mag'] = loss_mag_target.item()
 
         if verbose:
             print(f"\n  [Step2] pred_mag: {pred_mag.shape}  crop → (B, {min_f}, {min_t})")
@@ -607,11 +607,13 @@ class HybridSupervisionLoss(MultiResConsistencyLoss):
 
         # =====================================================================
         # Step 3: Complex Consistency Loss (real + imag only, no mag term).
-        # GT STFTs reused from Step 1 cache — no duplicate STFT computation.
-        # Downsampling logic is identical to MultiResConsistencyLoss.
         # =====================================================================
         if verbose:
             print(f"\n  [Step3] Complex consistency loop:")
+
+        _real_acc = 0.0
+        _imag_acc = 0.0
+        _res_w_sum = 0.0
 
         for i, (win_ms, hop_ms) in enumerate(self.config.target_resolutions):
             target_win_len = int(self.config.sr * win_ms / 1000)
@@ -671,14 +673,20 @@ class HybridSupervisionLoss(MultiResConsistencyLoss):
             loss_real = (F.mse_loss(pred_crop[..., 0], gt_crop[..., 0], reduction='none') * mask_crop).mean()
             loss_imag = (F.mse_loss(pred_crop[..., 1], gt_crop[..., 1], reduction='none') * mask_crop).mean()
 
-            current_loss = (loss_real * self.config.real_weight + loss_imag * self.config.imag_weight) * self.config.resolution_weights[i]
+            res_w = self.config.resolution_weights[i]
+            current_loss = (loss_real * self.config.real_weight + loss_imag * self.config.imag_weight) * res_w
             total_loss += current_loss
-            details[f"{win_ms}ms_{hop_ms}ms"] = current_loss.item()
+            _real_acc += loss_real.item() * res_w
+            _imag_acc += loss_imag.item() * res_w
+            _res_w_sum += res_w
 
             if verbose:
                 print(f"        crop → (B, {min_f}, {min_t}) | Loss Mag: {loss_mag_target.item():.5f}  "
                       f"Loss Real: {loss_real.item():.5f}  Imag: {loss_imag.item():.5f}  "
                       f"Weighted: {current_loss.item():.5f}")
+
+        details['loss_real'] = _real_acc / (_res_w_sum + 1e-8)
+        details['loss_imag'] = _imag_acc / (_res_w_sum + 1e-8)
 
         return total_loss, details
 
