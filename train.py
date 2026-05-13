@@ -101,7 +101,7 @@ def set_seed(seed):
 def plot_history(history, save_dir):
     os.makedirs(save_dir, exist_ok=True)
     plt.rcParams['font.family'] = 'sans-serif'
-    metrics = ['total', 'multi_res', 'recon', 'gompsnr', 'sisnr', 'entropy', 'tv']
+    metrics = ['total', 'multi_res', 'recon', 'gompsnr', 'sisnr', 'entropy', 'tv', 'loss_mag', 'loss_real', 'loss_imag']
     plt.figure(figsize=(15, 4 * ((len(metrics)+1)//2)))
     nrows = (len(metrics) + 1) // 2
     for i, metric in enumerate(metrics):
@@ -124,37 +124,33 @@ def train_one_epoch(models, criterions, optimizer, dataloader, config, device, e
     crit_multi, crit_gompsnr, crit_sisnr = criterions['multi'], criterions['gompsnr'], criterions['sisnr']
     
     encoder.train(); decoder.train(); crit_multi.train() 
-    loss_meter = {k: 0.0 for k in ['total', 'multi_res', 'recon', 'gompsnr', 'sisnr', 'entropy', 'tv']}
-    
+    loss_meter = {k: 0.0 for k in ['total', 'multi_res', 'recon', 'gompsnr', 'sisnr', 'entropy', 'tv', 'loss_mag', 'loss_real', 'loss_imag']}
+
     for batch_idx, x in enumerate(dataloader):
         x = x.to(device)
         optimizer.zero_grad()
-        
+
         z_complex = encoder(x)
         x_recon = decoder(z_complex)
-        # 新增：entropy 和 tv 在 encoder 输出的复数特征上计算
         entropy_loss_raw = compute_entropy_loss(z_complex)
         tv_loss_raw = compute_tv_loss(z_complex)
-        
-        # 计算原始 Loss
-        multi_loss_raw, _ = crit_multi(z_complex, x)
+
+        multi_loss_raw, multi_details = crit_multi(z_complex, x)
         recon_loss_raw = F.mse_loss(x, x_recon)
         gompsnr_loss_raw, _ = crit_gompsnr(x_recon, x)
-        sisnr_loss_raw = crit_sisnr(x_recon, x) 
+        sisnr_loss_raw = crit_sisnr(x_recon, x)
 
-        # 使用 config 对象进行外部加权
-        loss_total = (multi_loss_raw * config.multi_res_weight + 
-                      recon_loss_raw * config.recon_weight + 
+        loss_total = (multi_loss_raw * config.multi_res_weight +
+                      recon_loss_raw * config.recon_weight +
                       gompsnr_loss_raw * config.gompsnr_weight +
                       sisnr_loss_raw * config.sisnr_weight +
                       entropy_loss_raw * config.entropy_weight +
                       tv_loss_raw * config.tv_weight)
-        
+
         loss_total.backward()
         clip_grad_norm_(list(encoder.parameters())+list(decoder.parameters())+list(crit_multi.parameters()), config.grad_clip)
         optimizer.step()
-        
-        # 记录
+
         loss_meter['total'] += loss_total.item()
         loss_meter['multi_res'] += multi_loss_raw.item()
         loss_meter['recon'] += recon_loss_raw.item()
@@ -162,11 +158,15 @@ def train_one_epoch(models, criterions, optimizer, dataloader, config, device, e
         loss_meter['sisnr'] += sisnr_loss_raw.item()
         loss_meter['entropy'] += entropy_loss_raw.item()
         loss_meter['tv'] += tv_loss_raw.item()
-        
+        loss_meter['loss_mag'] += multi_details.get('loss_mag', 0.0)
+        loss_meter['loss_real'] += multi_details.get('loss_real', 0.0)
+        loss_meter['loss_imag'] += multi_details.get('loss_imag', 0.0)
+
         if batch_idx % config.log_interval == 0:
             print(f"Epoch: {epoch} [{batch_idx}/{len(dataloader)}] Loss: {loss_total.item():.4f} "
-                  f"(M:{multi_loss_raw.item():.2f} R:{recon_loss_raw.item():.2f} G:{gompsnr_loss_raw.item():.2f} S:{sisnr_loss_raw.item():.2f} E:{entropy_loss_raw.item():.2f} T:{tv_loss_raw.item():.2f})")
-            
+                  f"(M:{multi_loss_raw.item():.2f} R:{recon_loss_raw.item():.2f} G:{gompsnr_loss_raw.item():.2f} S:{sisnr_loss_raw.item():.2f} E:{entropy_loss_raw.item():.2f} T:{tv_loss_raw.item():.2f} "
+                  f"mag:{multi_details.get('loss_mag',0):.3f} re:{multi_details.get('loss_real',0):.3f} im:{multi_details.get('loss_imag',0):.3f})")
+
     return {k: v / len(dataloader) for k, v in loss_meter.items()}
 
 
@@ -175,7 +175,7 @@ def validate(models, criterions, dataloader, config, device):
     crit_multi, crit_gompsnr, crit_sisnr = criterions['multi'], criterions['gompsnr'], criterions['sisnr']
     encoder.eval(); decoder.eval(); crit_multi.eval()
     
-    loss_meter = {k: 0.0 for k in ['total', 'multi_res', 'recon', 'gompsnr', 'sisnr', 'entropy', 'tv']}
+    loss_meter = {k: 0.0 for k in ['total', 'multi_res', 'recon', 'gompsnr', 'sisnr', 'entropy', 'tv', 'loss_mag', 'loss_real', 'loss_imag']}
     with torch.no_grad():
         for x in dataloader:
             x = x.to(device)
@@ -184,18 +184,18 @@ def validate(models, criterions, dataloader, config, device):
             entropy_loss_raw = compute_entropy_loss(z_complex)
             tv_loss_raw = compute_tv_loss(z_complex)
 
-            multi_loss_raw, _ = crit_multi(z_complex, x)
+            multi_loss_raw, multi_details = crit_multi(z_complex, x)
             recon_loss_raw = F.mse_loss(x, x_recon)
             gompsnr_loss_raw, _ = crit_gompsnr(x_recon, x)
             sisnr_loss_raw = crit_sisnr(x_recon, x)
 
-            loss_total = (multi_loss_raw * config.multi_res_weight + 
-                          recon_loss_raw * config.recon_weight + 
+            loss_total = (multi_loss_raw * config.multi_res_weight +
+                          recon_loss_raw * config.recon_weight +
                           gompsnr_loss_raw * config.gompsnr_weight +
                           sisnr_loss_raw * config.sisnr_weight +
                           entropy_loss_raw * config.entropy_weight +
                           tv_loss_raw * config.tv_weight)
-            
+
             loss_meter['total'] += loss_total.item()
             loss_meter['multi_res'] += multi_loss_raw.item()
             loss_meter['recon'] += recon_loss_raw.item()
@@ -203,7 +203,10 @@ def validate(models, criterions, dataloader, config, device):
             loss_meter['sisnr'] += sisnr_loss_raw.item()
             loss_meter['entropy'] += entropy_loss_raw.item()
             loss_meter['tv'] += tv_loss_raw.item()
-            
+            loss_meter['loss_mag'] += multi_details.get('loss_mag', 0.0)
+            loss_meter['loss_real'] += multi_details.get('loss_real', 0.0)
+            loss_meter['loss_imag'] += multi_details.get('loss_imag', 0.0)
+
     return {k: v / len(dataloader) for k, v in loss_meter.items()}
 
 
@@ -285,8 +288,8 @@ def main():
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=config.lr_factor,
                                                             patience=config.lr_patience, min_lr=config.min_lr, verbose=True)
     
-    history = {'train': {k: [] for k in ['total', 'multi_res', 'recon', 'gompsnr', 'sisnr', 'entropy', 'tv']},
-               'valid': {k: [] for k in ['total', 'multi_res', 'recon', 'gompsnr', 'sisnr', 'entropy', 'tv']}}
+    history = {'train': {k: [] for k in ['total', 'multi_res', 'recon', 'gompsnr', 'sisnr', 'entropy', 'tv', 'loss_mag', 'loss_real', 'loss_imag']},
+               'valid': {k: [] for k in ['total', 'multi_res', 'recon', 'gompsnr', 'sisnr', 'entropy', 'tv', 'loss_mag', 'loss_real', 'loss_imag']}}
     
     best_loss = float('inf')
     best_checkpoint_path = None
