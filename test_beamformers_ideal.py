@@ -59,6 +59,30 @@ MULTI_SPK_ONLY = {"lcmv", "lcmp", "wlcmp", "mvdr_tfs", "mvdr_tfs_souden"}
 
 
 # ------------------------------------------------------------------ #
+# Standard STFT encode / decode (baseline)
+# ------------------------------------------------------------------ #
+
+def stft_mc(wav_mc: torch.Tensor, n_fft: int, hop: int) -> torch.Tensor:
+    """(C, T) → (C, F, T_f) complex64  using standard torch.stft"""
+    window = torch.hann_window(n_fft, device=wav_mc.device)
+    specs = []
+    for c in range(wav_mc.shape[0]):
+        s = torch.stft(
+            wav_mc[c], n_fft=n_fft, hop_length=hop, win_length=n_fft,
+            window=window, return_complex=True, center=True, pad_mode="reflect",
+        )
+        specs.append(s)
+    return torch.stack(specs)   # (C, F, T_f)
+
+
+def istft_ch(spec: torch.Tensor, n_fft: int, hop: int, T: int) -> torch.Tensor:
+    """(F, T_f) complex → (T,)"""
+    window = torch.hann_window(n_fft, device=spec.device)
+    return torch.istft(spec, n_fft=n_fft, hop_length=hop, win_length=n_fft,
+                       window=window, length=T)
+
+
+# ------------------------------------------------------------------ #
 # Model loading and encode / decode wrappers
 # ------------------------------------------------------------------ #
 
@@ -245,6 +269,12 @@ def parse_args():
     p.add_argument("--ref_channel", type=int, default=3,
                    help="Reference mic index in the 5-ch array (3 = CH5)")
     p.add_argument("--mask_type", choices=["irm", "ibm"], default="irm")
+    p.add_argument("--use_stft", action="store_true",
+                   help="Baseline mode: use standard STFT/iSTFT instead of SuperRes model")
+    p.add_argument("--n_fft",       type=int, default=512,
+                   help="FFT size for standard STFT baseline")
+    p.add_argument("--hop_length",  type=int, default=128,
+                   help="Hop length for standard STFT baseline")
     p.add_argument("--config_yaml", default=str(_here / "exp/v6-4/config.yaml"))
     p.add_argument("--checkpoint",  default=str(_here / "exp/v6-4/best_valid_loss.pth"))
     p.add_argument("--beamformers", nargs="+", default=DEFAULT_BFS,
@@ -379,18 +409,27 @@ def main():
         bfs.append(resolved)
 
     # create timestamped results directory
+    mode    = "stft" if args.use_stft else "superres"
     ts      = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    res_dir = Path(__file__).resolve().parent / "results" / f"eval_{ts}"
+    res_dir = Path(__file__).resolve().parent / "bf_eval" / f"eval_{mode}_{ts}"
     res_dir.mkdir(parents=True, exist_ok=True)
     print(f"\nResults will be saved to: {res_dir}")
 
-    # load pretrained encoder / decoder
-    print(f"\nLoading model ...")
-    print(f"  config:     {args.config_yaml}")
-    print(f"  checkpoint: {args.checkpoint}")
-    enc, dec, cfg = load_model(args.config_yaml, args.checkpoint, device)
-    print(f"  base_win_len={cfg.base_win_len}  base_hop_len={cfg.base_hop_len}  "
-          f"freq_bins={cfg.base_win_len // 2 + 1}")
+    # load model or prepare STFT params
+    if args.use_stft:
+        enc = dec = None
+        n_fft = args.n_fft
+        hop   = args.hop_length
+        print(f"\nBaseline mode: standard STFT  n_fft={n_fft}  hop={hop}")
+    else:
+        print(f"\nLoading SuperRes model ...")
+        print(f"  config:     {args.config_yaml}")
+        print(f"  checkpoint: {args.checkpoint}")
+        enc, dec, cfg = load_model(args.config_yaml, args.checkpoint, device)
+        n_fft = cfg.base_win_len
+        hop   = cfg.base_hop_len
+        print(f"  base_win_len={n_fft}  base_hop_len={hop}  "
+              f"freq_bins={n_fft // 2 + 1}")
 
     # ---- per-utterance records (for CSV) ----
     # columns: utt_id, split, noise_cond, input_sisdr, <btype>...
@@ -436,9 +475,14 @@ def main():
                 wav_dict[utt_id], spk1_dict[utt_id], device
             )
 
-            mix_stft    = encode_mc(mix_mc,    enc)
-            speech_stft = encode_mc(speech_mc, enc)
-            noise_stft  = encode_mc(noise_mc,  enc)
+            if args.use_stft:
+                mix_stft    = stft_mc(mix_mc,    n_fft, hop)
+                speech_stft = stft_mc(speech_mc, n_fft, hop)
+                noise_stft  = stft_mc(noise_mc,  n_fft, hop)
+            else:
+                mix_stft    = encode_mc(mix_mc,    enc)
+                speech_stft = encode_mc(speech_mc, enc)
+                noise_stft  = encode_mc(noise_mc,  enc)
 
             if args.mask_type == "irm":
                 mask_s, mask_n = ideal_ratio_mask(speech_stft, noise_stft)
@@ -466,7 +510,10 @@ def main():
                         rtf_iter=args.rtf_iterations,
                         btaps=args.btaps, bdelay=args.bdelay,
                     )
-                    enh_wav = decode_ch(enh_stft, T, dec)
+                    if args.use_stft:
+                        enh_wav = istft_ch(enh_stft, n_fft, hop, T)
+                    else:
+                        enh_wav = decode_ch(enh_stft, T, dec)
                     val = si_sdr(enh_wav, speech_ref)
 
                     if args.save_wav:
@@ -508,14 +555,19 @@ def main():
     # ------------------------------------------------------------------ #
     all_input_arr = np.array(all_input, dtype=float)
 
+    if args.use_stft:
+        tf_info = f"Standard STFT  n_fft={n_fft}  hop={hop}"
+    else:
+        tf_info = f"SuperRes encoder  n_fft={n_fft}  hop={hop}  ckpt={args.checkpoint}"
+
     report_lines = [
         f"Beamformer Evaluation Report",
-        f"Generated : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"Checkpoint: {args.checkpoint}",
-        f"Splits    : {args.splits}",
-        f"Mask type : {args.mask_type.upper()}",
-        f"Ref ch    : {args.ref_channel}  (CH5)",
-        f"Total utts: {len(all_input)}",
+        f"Generated  : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Mode       : {tf_info}",
+        f"Splits     : {args.splits}",
+        f"Mask type  : {args.mask_type.upper()}",
+        f"Ref ch     : {args.ref_channel}  (CH5)",
+        f"Total utts : {len(all_input)}",
         "",
     ]
 
