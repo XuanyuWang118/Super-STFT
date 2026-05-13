@@ -1,5 +1,5 @@
-from math import exp
 import os
+import re
 import yaml
 import torch
 import librosa
@@ -7,54 +7,89 @@ import librosa.display
 import numpy as np
 import matplotlib.pyplot as plt
 import soundfile as sf
+import argparse
 from matplotlib.gridspec import GridSpec
 from scipy.interpolate import interp1d
 
-# 引入你的模型定义
-from super_res_spec import STFTConfig, SuperResEncoder
+from super_res_spec import STFTConfig, SuperResEncoder, HybridSupervisionLoss
 
 def resample_spec_to_target_time(spec, original_hop, sr, target_times):
-    """
-    最标准的对齐方式：将声谱图插值到指定的目标时间点上。
-    
-    spec: (Freq, Time)
-    original_hop: 原始 Hop 长度 (samples)
-    sr: 采样率
-    target_times: 目标时间点数组 (秒)
-    """
     n_freq, n_time = spec.shape
-    # 1. 构建原始时间轴
-    # 每一帧的中心时间点或起始时间点。STFT center=True 时，第i帧对应 i * hop / sr
     original_times = np.arange(n_time) * original_hop / sr
-    
-    # 2. 创建插值函数
-    # axis=1 表示沿时间轴插值
-    # kind='nearest': 保持原始像素块状结构，不模糊 (最适合展示不同分辨率的对比)
-    # kind='linear': 平滑过渡
-    # fill_value="extrapolate": 防止边缘极微小的浮点误差导致 NaN
     interpolator = interp1d(original_times, spec, kind='nearest', axis=1, fill_value="extrapolate")
-    
-    # 3. 计算目标时间点的值
     aligned_spec = interpolator(target_times)
-    
     return aligned_spec
 
 def plot_aligned_spectrogram(ax, spec, title, sr, start_time, end_time):
-    """
-    绘制已经对齐好数据的声谱图
-    """
     spec_db = librosa.amplitude_to_db(spec, ref=np.max)
-    
-    # 因为数据已经严格对齐到 [start_time, end_time]，我们可以直接指定 extent
     extent = [start_time, end_time, 0, sr / 2]
-    
     img = ax.imshow(spec_db, origin='lower', aspect='auto', cmap='magma', extent=extent, interpolation='none')
-    
-    ax.set_title(title, fontsize=10, weight='bold')
+    ax.set_title(title, fontsize=12, weight='bold')
     ax.set_ylabel('Freq (Hz)')
     return img
 
+def load_best_or_latest_model(encoder, exp_dir, device):
+    """尝试加载 best_valid_loss.pth，否则加载最新的 *epoch.pth"""
+    best_path = os.path.join(exp_dir, "best_valid_loss.pth")
+    if os.path.exists(best_path):
+        print(f"Loaded BEST model from {best_path}")
+        ckpt = torch.load(best_path, map_location=device)
+        encoder.load_state_dict(ckpt['encoder'])
+        return True
+
+    print(f"Best model not found. Searching for latest epoch in {exp_dir}...")
+    ckpt_list = [f for f in os.listdir(exp_dir) if f.endswith('epoch.pth')]
+    if not ckpt_list:
+        print("[Warning] No model found, utilizing random init.")
+        return False
+        
+    ckpt_list.sort(key=lambda f: int(re.findall(r'\d+', f)[0]))
+    latest_path = os.path.join(exp_dir, ckpt_list[-1])
+    print(f"Loaded LATEST model from {latest_path}")
+    ckpt = torch.load(latest_path, map_location=device)
+    encoder.load_state_dict(ckpt['encoder'])
+    return True
+
+def compute_and_cache_features(audio_segment, sr, stft_cfg, device, cache_path):
+    """一次性计算目标、原始STFT和投影，并保存为文件"""
+    print(f"--- Computing and caching features to {cache_path} ---")
+
+    super_hop = stft_cfg.base_hop_len
+    x = torch.from_numpy(audio_segment).unsqueeze(0).unsqueeze(0).to(device)
+
+    cache_dict = {
+        'stft': [],     # List of (mag_np, win_ms, hop_ms, hop_len)
+        'proj': [],     # List of (mag_proj_np, win_ms, hop_ms, super_hop)
+        'target': None  # (target_mag_np, super_hop)
+    }
+
+    # 原始 STFT（native hop，用于绘图 Section C）
+    for win_ms, hop_ms in stft_cfg.target_resolutions:
+        n_fft_curr = int(sr * win_ms / 1000)
+        target_hop_len = int(sr * hop_ms / 1000)
+        S = librosa.stft(audio_segment, n_fft=n_fft_curr, hop_length=target_hop_len, window='hann', center=True)
+        cache_dict['stft'].append((np.abs(S), win_ms, hop_ms, target_hop_len))
+
+    # 交集目标和归一化投影：直接复用模型的 compute_intersection，保证逻辑完全一致
+    loss_fn = HybridSupervisionLoss(stft_cfg).to(device)
+    with torch.no_grad():
+        intersection_mag, mag_stack_normed, _, __ = loss_fn.compute_intersection(x, verbose=False)
+
+    cache_dict['target'] = (intersection_mag.squeeze(0).cpu().numpy(), super_hop)
+
+    for (win_ms, hop_ms), mag_normed in zip(stft_cfg.target_resolutions, mag_stack_normed):
+        cache_dict['proj'].append((mag_normed.squeeze(0).cpu().numpy(), win_ms, hop_ms, super_hop))
+
+    torch.save(cache_dict, cache_path)
+    print(f"Caching completed successfully!")
+    return cache_dict
+
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--mode', type=str, default='plot', choices=['plot', 'cache_only'], 
+                        help='plot: normal plotting, cache_only: just compute and save features without plotting.')
+    args = parser.parse_args()
+
     # ================= 1. Load Config =================
     config_path = "config.yaml"
     if not os.path.exists(config_path):
@@ -63,129 +98,111 @@ def main():
     with open(config_path, 'r') as f:
         config_dict = yaml.safe_load(f)
 
-    vis_cfg = config_dict['visualization']
-    train_cfg = config_dict['train']
-    stft_dict = config_dict['stft']
+    vis_cfg = config_dict.get('visualization', {})
+    train_cfg = config_dict.get('train', {})
     
-    # Paths
-    exp_dir = train_cfg['exp_dir']
-    model_path = os.path.join(exp_dir, "best_valid_loss.pth")
+    exp_dir = train_cfg.get('exp_dir', 'exp')
     save_dir = os.path.join(exp_dir, "image")
     os.makedirs(save_dir, exist_ok=True)
     
-    test_audio_path = vis_cfg['test_audio_path']
-    
-    # Zoom Setting
+    test_audio_path = vis_cfg.get('test_audio_path', '')
     zoom_start = vis_cfg.get('zoom_start', 0.5)
-    zoom_end = vis_cfg.get('zoom_end', 1.0)
+    zoom_end = vis_cfg.get('zoom_end', 0.8)
+    plot_items = vis_cfg.get('plot_items', ['pred', 'target', 'stft', 'proj']) # 从配置读取需要画的项
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-    # ================= 2. Load Model & Data =================
-    stft_cfg = STFTConfig(cfg_dict=config_dict)
-    encoder = SuperResEncoder(stft_cfg).to(device)
-    
-    if os.path.exists(model_path):
-        checkpoint = torch.load(model_path, map_location=device)
-        encoder.load_state_dict(checkpoint['encoder'])
-        print(f"Loaded model from {model_path}")
-    else:
-        print(f"[Warning] Model not found at {model_path}, utilizing random init.")
-    
-    encoder.eval()
-
+    # ================= 2. Prepare Data =================
     print(f"Processing {test_audio_path}...")
     audio, sr = sf.read(test_audio_path, dtype='float32')
     if audio.ndim > 1: audio = audio[:, 0]
     
-    # 截取范围稍微大一点，保证插值时两头都有数据
     buffer_s = 0.5
     start_sample = max(0, int((zoom_start - buffer_s) * sr))
     end_sample = min(len(audio), int((zoom_end + buffer_s) * sr))
     
     audio_segment = audio[start_sample:end_sample]
-    # 记录这段截取音频相对于原始文件的起始时间偏移
     offset_s = start_sample / sr
-    
     x = torch.from_numpy(audio_segment).unsqueeze(0).unsqueeze(0).to(device)
 
-    # ================= 3. Compute Spectrograms =================
+    # ================= 3. Handle Cache for Fixed Features =================
+    stft_cfg = STFTConfig(cfg_dict=config_dict)
+    audio_name = os.path.splitext(os.path.basename(test_audio_path))[0]
+    cache_path = os.path.join(exp_dir, f"{audio_name}_stft_cache.pt")
+
+    if not os.path.exists(cache_path):
+        cache_dict = compute_and_cache_features(audio_segment, sr, stft_cfg, device, cache_path)
+    else:
+        print(f"Loading cached features from {cache_path}...")
+        cache_dict = torch.load(cache_path, weights_only=False)
+
+    if args.mode == 'cache_only':
+        return # 如果只要求缓存，到此结束
+
+    # ================= 4. Prepare Plotting Items =================
     specs_to_plot = [] 
     
-    # A. Super-Resolution
-    with torch.no_grad():
-        z_complex = encoder(x) 
-        z_mag = torch.norm(z_complex, dim=-1).squeeze(0).cpu().numpy()
-    
-    super_hop = stft_cfg.base_hop_len
-    specs_to_plot.append((z_mag, "Super-Res-Encoder", super_hop))
-    
-    # B. Target Resolutions
-    resolutions = stft_dict['target_resolutions']
-    
-    for win_ms, hop_ms in resolutions:
-        n_fft = int(sr * win_ms / 1000)
-        hop_len = int(sr * hop_ms / 1000)
-        
-        S = librosa.stft(audio_segment, n_fft=n_fft, hop_length=hop_len, window='hann', center=True)
-        S_mag = np.abs(S)
-        
-        title = f"STFT (Win={win_ms}ms, Hop={hop_ms}ms)"
-        specs_to_plot.append((S_mag, title, hop_len))
+    # A. Super-Resolution Prediction
+    if 'pred' in plot_items:
+        encoder = SuperResEncoder(stft_cfg).to(device)
+        load_best_or_latest_model(encoder, exp_dir, device)
+        encoder.eval()
+        with torch.no_grad():
+            z_complex = encoder(x) 
+            z_mag = torch.norm(z_complex, dim=-1).squeeze(0).cpu().numpy()
+        specs_to_plot.append((z_mag, "Super-Res-Encoder [Prediction]", stft_cfg.base_hop_len))
 
-    # ================= 4. Data Alignment Logic (The Standard Way) =================
-    
-    # 定义公共的绘图时间轴 (Target Time Axis)
-    # 我们只关心 zoom_start 到 zoom_end 这一段
-    # 分辨率设为极高，例如 1000个点，或者对应 0.5ms 一个点
-    # 注意：这里的 zoom_start 是绝对时间，需要减去 offset_s 变成相对于 audio_segment 的时间
-    rel_zoom_start = zoom_start - offset_s
-    rel_zoom_end = zoom_end - offset_s
-    
-    # 检查边界安全性
-    rel_zoom_start = max(0, rel_zoom_start)
-    rel_zoom_end = min(len(audio_segment)/sr, rel_zoom_end)
-    
-    # 生成 1000 个均匀分布的时间点用于插值
+    # B. Target
+    if 'target' in plot_items:
+        mag, hop = cache_dict['target']
+        specs_to_plot.append((mag, "Ultimate Target [Min Intersection]", hop))
+
+    # C. Original STFTs
+    if 'stft' in plot_items:
+        for mag, win_ms, hop_ms, hop in cache_dict['stft']:
+            specs_to_plot.append((mag, f"STFT (Win={win_ms}ms, Hop={hop_ms}ms)", hop))
+
+    # D. Projected STFTs
+    if 'proj' in plot_items:
+        for mag, win_ms, hop_ms, hop in cache_dict['proj']:
+            specs_to_plot.append((mag, f"Proj STFT (Win={win_ms}ms, Hop={hop_ms}ms)", hop))
+
+    # ================= 5. Data Alignment & Plotting =================
+    if not specs_to_plot:
+        print("Nothing to plot based on 'plot_items' config.")
+        return
+
+    rel_zoom_start = max(0, zoom_start - offset_s)
+    rel_zoom_end = min(len(audio_segment)/sr, zoom_end - offset_s)
     target_times = np.linspace(rel_zoom_start, rel_zoom_end, num=800)
     
-    # ================= 5. Plotting =================
     num_plots = len(specs_to_plot)
     plt.rcParams['font.family'] = 'sans-serif'
-    fig = plt.figure(figsize=(12, 3 * num_plots))
+    fig = plt.figure(figsize=(14, 3 * num_plots))
     gs = GridSpec(num_plots, 2, width_ratios=[1, 1]) 
 
     print(f"Plotting aligned range: {zoom_start:.3f}s to {zoom_end:.3f}s")
 
     for i, (spec, title, hop) in enumerate(specs_to_plot):
-        # --- Column 0: Full View (Original Data, Linear mapping) ---
-        # 全图我们不需要插值，直接画原始数据即可，用 extent 映射物理时间
+        # Column 0: Full View
         ax_full = fig.add_subplot(gs[i, 0])
         full_start = offset_s
         full_end = offset_s + spec.shape[1] * hop / sr
-        
-        # 简单显示截取的这一整段
         plot_aligned_spectrogram(ax_full, spec, f"{title} [Segment]", sr, full_start, full_end)
         ax_full.set_xlabel('Time (s)')
-        # 画个框标出 Zoom 区域
-        ax_full.axvline(x=zoom_start, color='white', linestyle='--', linewidth=1, alpha=0.7)
-        ax_full.axvline(x=zoom_end, color='white', linestyle='--', linewidth=1, alpha=0.7)
+        ax_full.axvline(x=zoom_start, color='white', linestyle='--', linewidth=1.5, alpha=0.8)
+        ax_full.axvline(x=zoom_end, color='white', linestyle='--', linewidth=1.5, alpha=0.8)
         
-        # --- Column 1: Zoom View (Resampled & Strictly Aligned) ---
+        # Column 1: Zoom View
         ax_zoom = fig.add_subplot(gs[i, 1])
-        
-        # 核心步骤：插值对齐
-        # 将当前 spec 插值到 target_times 这个统一的时间轴上
         aligned_spec_data = resample_spec_to_target_time(spec, hop, sr, target_times)
-        
-        # 绘图：现在所有图的 extent 都是严格的 [zoom_start, zoom_end]
         plot_aligned_spectrogram(ax_zoom, aligned_spec_data, f"{title} [Zoom]", sr, zoom_start, zoom_end)
-        
-        # 设置 X 轴标签格式
         ax_zoom.set_xlabel('Time (s)')
 
     plt.tight_layout()
-    save_path = os.path.join(save_dir, vis_cfg['save_filename'])
+    save_filename = vis_cfg.get('save_filename', f"{audio_name}_spec.png")
+    save_path = os.path.join(save_dir, save_filename)
     plt.savefig(save_path, dpi=200, bbox_inches='tight')
     print(f"Visualization saved to {save_path}")
     plt.close()
