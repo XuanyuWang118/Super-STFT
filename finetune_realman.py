@@ -20,6 +20,7 @@ Usage:
 
 import argparse
 import json
+import logging
 import os
 import random
 import sys
@@ -36,9 +37,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import soundfile as sf
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import torchaudio
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torch.nn.utils import clip_grad_norm_
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -110,21 +114,21 @@ def _build_or_load_index(speech_root: Path, noise_root: Path, cache_path: str):
     """Load from JSON cache if available; otherwise build and save.
     Subsequent runs skip all filesystem scanning entirely."""
     if os.path.exists(cache_path):
-        print(f"Loading index cache: {cache_path}", flush=True)
+        logger.info(f"Loading index cache: {cache_path}")
         with open(cache_path) as f:
             data = json.load(f)
         items = [(d["room"], d["ch_files"]) for d in data["speech"]]
         noise_idx = defaultdict(list)
         for room, recs in data["noise"].items():
             noise_idx[room] = recs
-        print(f"  speech={len(items)}  noise_rooms={len(noise_idx)}", flush=True)
+        logger.info(f"  speech={len(items)}  noise_rooms={len(noise_idx)}")
         return items, noise_idx
 
-    print("Building index (first run — will be cached)...", flush=True)
+    logger.info("Building index (first run — will be cached)...")
     t0 = time.time()
     items = _index_speech(speech_root)
     noise_idx = _index_noise(noise_root)
-    print(f"  Indexed {len(items)} utterances in {time.time()-t0:.1f}s", flush=True)
+    logger.info(f"  Indexed {len(items)} utterances in {time.time()-t0:.1f}s")
 
     os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
     with open(cache_path, "w") as f:
@@ -132,7 +136,7 @@ def _build_or_load_index(speech_root: Path, noise_root: Path, cache_path: str):
             "speech": [{"room": r, "ch_files": chs} for r, chs in items],
             "noise":  {room: recs for room, recs in noise_idx.items()},
         }, f)
-    print(f"  Cache saved: {cache_path}", flush=True)
+    logger.info(f"  Cache saved: {cache_path}")
     return items, noise_idx
 
 
@@ -285,10 +289,9 @@ def process_sample(enc, dec, hybrid_loss, sample, device, bf_weight: float):
     N_ri = encode_mc(noise_mc,  enc)
     X_ri = encode_mc(mix_mc,    enc)
 
-    # HybridSupervisionLoss: C channels act as batch dimension.
-    # Internal weights (real/imag/mag/resolution) are read from STFTConfig.
-    # The outer multi_res_weight multiplier from pretraining is intentionally
-    # NOT applied here — fine-tuning uses the raw normalized loss directly.
+    # HybridSupervisionLoss on each signal independently.
+    # Outer multi_res_weight (300×) from pretraining is intentionally not applied
+    # here; fine-tuning uses the raw normalized internal loss.
     loss_S, _ = hybrid_loss(S_ri, speech_mc.unsqueeze(1))
     loss_N, _ = hybrid_loss(N_ri, noise_mc.unsqueeze(1))
     loss_X, _ = hybrid_loss(X_ri, mix_mc.unsqueeze(1))
@@ -303,13 +306,13 @@ def process_sample(enc, dec, hybrid_loss, sample, device, bf_weight: float):
             X_c = torch.view_as_complex(X_ri.contiguous())
             with torch.no_grad():
                 Y = irm_beamform(S_c, N_c, X_c, ref_ch=0)
-            Y_ri   = torch.view_as_real(Y).unsqueeze(0)          # (1, F, T_f, 2)
-            y_wav  = dec(Y_ri, target_len=T).squeeze()            # (T,)
-            s_ri_ref = S_ri[0:1]                                  # (1, F, T_f, 2)
-            s_wav    = dec(s_ri_ref, target_len=T).squeeze()      # (T,)
+            Y_ri     = torch.view_as_real(Y).unsqueeze(0)
+            y_wav    = dec(Y_ri, target_len=T).squeeze()
+            s_ri_ref = S_ri[0:1]
+            s_wav    = dec(s_ri_ref, target_len=T).squeeze()
             bf_loss  = F.l1_loss(y_wav, s_wav)
         except Exception:
-            pass
+            logger.warning(f"    bf step failed: {traceback.format_exc()}")
 
     loss = stft_loss + bf_weight * bf_loss
     return loss, stft_loss, bf_loss
@@ -320,19 +323,27 @@ def process_sample(enc, dec, hybrid_loss, sample, device, bf_weight: float):
 # -----------------------------------------------------------------------
 
 def run_epoch(enc, dec, hybrid_loss, optimizer, samples, device,
-              is_train, grad_clip, bf_weight, log_interval=200, total_samples=None):
+              is_train, grad_clip, bf_weight, log_interval=200,
+              total_samples=None, max_steps=None):
     enc.train(is_train); dec.train(is_train)
 
     totals = dict(total=0.0, stft=0.0, bf=0.0)
     n = 0
     t0 = time.time()
+    cap = min(max_steps, total_samples) if (max_steps and total_samples) else (max_steps or total_samples)
 
+    logger.info("  waiting for first batch...")
     ctx = torch.enable_grad() if is_train else torch.no_grad()
     with ctx:
         for i, sample in enumerate(samples):
+            if i == 0:
+                logger.info("  first batch received")
+            t_step = time.time()
             loss, sl, bl = process_sample(
                 enc, dec, hybrid_loss, sample, device, bf_weight
             )
+            if i == 0:
+                logger.info(f"  first sample done in {time.time()-t_step:.2f}s")
             if is_train:
                 optimizer.zero_grad()
                 loss.backward()
@@ -344,28 +355,29 @@ def run_epoch(enc, dec, hybrid_loss, optimizer, samples, device,
             totals["bf"]    += bl.item() if isinstance(bl, torch.Tensor) else float(bl)
             n += 1
 
-            if log_interval > 0 and (i + 1) % log_interval == 0:
+            if log_interval > 0 and n % log_interval == 0:
                 elapsed = time.time() - t0
                 avg = elapsed / n
-                if total_samples:
-                    remaining = total_samples - n
-                    eta_s = int(remaining * avg)
+                if cap:
+                    eta_s = int((cap - n) * avg)
                     eta_str = f"  ETA={eta_s//3600:02d}h{eta_s%3600//60:02d}m{eta_s%60:02d}s"
-                    progress = f"[{n}/{total_samples}]"
+                    progress = f"[{n}/{cap}]"
                 else:
                     eta_str = ""
                     progress = f"[{n}]"
-                print(
+                logger.info(
                     f"  {progress} "
                     f"total={totals['total']/n:.4f}  "
                     f"stft={totals['stft']/n:.4f}  "
                     f"bf={totals['bf']/n:.4f}  "
                     f"avg={avg:.2f}s/sample{eta_str}"
                 )
-                sys.stdout.flush()
 
-    k = max(n, 1)
-    return {k: v / k for k, v in totals.items()}
+            if max_steps and n >= max_steps:
+                break
+
+    denom = max(n, 1)
+    return {key: val / denom for key, val in totals.items()}
 
 
 # -----------------------------------------------------------------------
@@ -399,6 +411,79 @@ def plot_loss_curves(history: dict, save_path: Path, best_epoch: int = None):
 
 
 # -----------------------------------------------------------------------
+# Distributed helpers
+# -----------------------------------------------------------------------
+
+def init_distributed():
+    """Init NCCL process group when launched via torchrun; no-op otherwise.
+    Returns (is_dist, rank, world_size).
+    """
+    if "RANK" not in os.environ:
+        return False, 0, 1
+    dist.init_process_group(backend="nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    torch.cuda.set_device(rank)
+    return True, rank, world_size
+
+
+def cleanup_distributed():
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+# -----------------------------------------------------------------------
+# Logger setup
+# -----------------------------------------------------------------------
+
+def setup_logger(log_path: Path) -> logging.Logger:
+    """Create a logger that writes to both stdout and train.log simultaneously."""
+    logger = logging.getLogger("finetune")
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+
+    fmt = logging.Formatter("%(message)s")
+
+    fh = logging.FileHandler(str(log_path), mode="w", encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setLevel(logging.DEBUG)
+    sh.setFormatter(fmt)
+
+    logger.addHandler(fh)
+    logger.addHandler(sh)
+    return logger
+
+
+class _StderrToLogger:
+    """Redirect sys.stderr so CUDA/worker errors also land in train.log."""
+    def __init__(self, lg: logging.Logger):
+        self._lg = lg
+        self._buf = ""
+
+    def write(self, msg: str):
+        self._buf += msg
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if line.strip():
+                self._lg.error(line)
+
+    def flush(self):
+        if self._buf.strip():
+            self._lg.error(self._buf)
+            self._buf = ""
+
+    def fileno(self):
+        return sys.__stderr__.fileno()
+
+
+# Module-level logger — populated in main() before any training code runs.
+logger: logging.Logger = logging.getLogger("finetune")
+
+
+# -----------------------------------------------------------------------
 # Config & args
 # -----------------------------------------------------------------------
 
@@ -426,6 +511,7 @@ def load_ft_config(yaml_path: str) -> dict:
         log_interval=200, seed=42, num_workers=8,
         sr=16000, seg_len=2.0, min_ch=2, max_ch=8,
         snr_min=-5.0, snr_max=20.0, bf_weight=1.0,
+        max_steps_per_epoch=None,
         val_rooms=["Cafeteria2", "Park", "Car-Electric"],
     )
     defaults.update(ft)
@@ -445,6 +531,8 @@ def set_seed(seed):
 # -----------------------------------------------------------------------
 
 def main():
+    global logger
+
     args = parse_args()
     ft   = load_ft_config(args.config)
     set_seed(ft["seed"])
@@ -452,50 +540,40 @@ def main():
     exp_dir = Path(ft["exp_dir"])
     exp_dir.mkdir(parents=True, exist_ok=True)
 
-    log_path = exp_dir / "train.log"
-    log_fh   = open(log_path, "w", buffering=1)
+    # Set up logging: all output (info + errors) goes to both stdout and train.log
+    logger = setup_logger(exp_dir / "train.log")
+    sys.stderr = _StderrToLogger(logger)
 
-    def log(msg):
-        print(msg); print(msg, file=log_fh); sys.stdout.flush()
+    logger.info(f"Config: {args.config}  [phase_finetune]")
+    logger.info(f"Settings: {ft}")
 
-    # Redirect stderr so worker errors and CUDA errors appear in train.log
-    sys.stderr = log_fh
-
-    log(f"Config: {args.config}  [phase_finetune]")
-    log(f"Settings: {ft}")
-
-    # Under SLURM, CUDA_VISIBLE_DEVICES is set by the scheduler;
-    # cuda:0 always refers to the allocated GPU.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log(f"Device: {device}")
+    logger.info(f"Device: {device}")
 
-    # Load pretrained SuperRes model.
-    # HybridSupervisionLoss reads real/imag/mag/resolution weights from pretrain_config.
     cfg = STFTConfig(yaml_path=ft["pretrain_config"])
     enc = SuperResEncoder(cfg).to(device)
     dec = SuperResDecoder(cfg).to(device)
     ckpt = torch.load(ft["pretrain_ckpt"], map_location="cpu")
     enc.load_state_dict(ckpt["encoder"])
     dec.load_state_dict(ckpt["decoder"])
-    log(f"Loaded checkpoint: {ft['pretrain_ckpt']}  (epoch {ckpt.get('epoch', '?')})")
+    logger.info(f"Loaded checkpoint: {ft['pretrain_ckpt']}  (epoch {ckpt.get('epoch', '?')})")
 
     hybrid_loss = HybridSupervisionLoss(cfg).to(device)
     for param in hybrid_loss.parameters():
         param.requires_grad_(False)
 
-    # Index data (JSON cache avoids slow GPFS scanning on subsequent runs)
     data_root  = Path(ft["data_root"])
     train_root = data_root / "train"
     cache_path = str(exp_dir / "realman_index_cache.json")
     all_items, noise_idx = _build_or_load_index(
         train_root / "ma_speech", train_root / "ma_noise", cache_path
     )
-    log(f"Total utterances indexed: {len(all_items)}")
+    logger.info(f"Total utterances indexed: {len(all_items)}")
 
     val_rooms   = set(ft["val_rooms"])
     train_items = [(r, c) for r, c in all_items if r not in val_rooms]
     val_items   = [(r, c) for r, c in all_items if r in val_rooms]
-    log(f"Train: {len(train_items)}  Val: {len(val_items)}  (val rooms: {sorted(val_rooms)})")
+    logger.info(f"Train: {len(train_items)}  Val: {len(val_items)}  (val rooms: {sorted(val_rooms)})")
 
     train_noise = {r: v for r, v in noise_idx.items() if r not in val_rooms}
     val_noise   = {r: v for r, v in noise_idx.items() if r in val_rooms}
@@ -511,14 +589,17 @@ def main():
                               min_ch=ft["min_ch"], max_ch=ft["max_ch"],
                               snr_min=ft["snr_min"], snr_max=ft["snr_max"])
 
-    # batch_size=1: each sample has variable channel count;
-    # pin_memory=False: collate returns list of tuples, not stacked tensors
-    train_loader = DataLoader(train_ds, batch_size=1, shuffle=True,
-                              num_workers=ft["num_workers"], collate_fn=_collate,
-                              pin_memory=False)
-    val_loader   = DataLoader(val_ds,   batch_size=1, shuffle=False,
-                              num_workers=ft["num_workers"], collate_fn=_collate,
-                              pin_memory=False)
+    nw = ft["num_workers"]
+    loader_kwargs = dict(
+        batch_size=1, collate_fn=_collate, pin_memory=False,
+        num_workers=nw,
+        **(dict(multiprocessing_context="spawn", persistent_workers=True,
+                prefetch_factor=2) if nw > 0 else {}),
+    )
+    train_loader = DataLoader(train_ds, shuffle=True,  **loader_kwargs)
+    val_loader   = DataLoader(val_ds,   shuffle=False, **loader_kwargs)
+    logger.info(f"DataLoader: num_workers={nw}"
+                + (" (spawn+persistent)" if nw > 0 else " (in-process)"))
 
     optimizer = torch.optim.Adam(
         list(enc.parameters()) + list(dec.parameters()), lr=ft["learning_rate"]
@@ -538,45 +619,47 @@ def main():
 
     for epoch in range(1, ft["epochs"] + 1):
         t0 = time.time()
-        log(f"\n=== Epoch {epoch}/{ft['epochs']}  (lr={optimizer.param_groups[0]['lr']:.2e}) ===")
+        logger.info(f"\n=== Epoch {epoch}/{ft['epochs']}  (lr={optimizer.param_groups[0]['lr']:.2e}) ===")
 
-        log("  [Train]")
+        logger.info("  [Train]")
         try:
             tr = run_epoch(enc, dec, hybrid_loss, optimizer,
                            iter_samples(train_loader), device,
                            is_train=True, grad_clip=ft["grad_clip"],
                            bf_weight=ft["bf_weight"], log_interval=ft["log_interval"],
-                           total_samples=len(train_ds))
+                           total_samples=len(train_ds),
+                           max_steps=ft.get("max_steps_per_epoch"))
         except Exception:
-            log(f"[ERROR] Train epoch {epoch} failed:\n{traceback.format_exc()}")
+            logger.error(f"[ERROR] Train epoch {epoch} failed:\n{traceback.format_exc()}")
             break
 
-        log("  [Val]")
+        logger.info("  [Val]")
         try:
             vl = run_epoch(enc, dec, hybrid_loss, None,
                            iter_samples(val_loader), device,
                            is_train=False, grad_clip=ft["grad_clip"],
                            bf_weight=ft["bf_weight"], log_interval=0,
-                           total_samples=len(val_ds))
+                           total_samples=len(val_ds),
+                           max_steps=ft.get("max_steps_per_epoch"))
         except Exception:
-            log(f"[ERROR] Val epoch {epoch} failed:\n{traceback.format_exc()}")
+            logger.error(f"[ERROR] Val epoch {epoch} failed:\n{traceback.format_exc()}")
             break
 
         elapsed = time.time() - t0
-        log(f"  Epoch {epoch} | "
+        logger.info(
+            f"  Epoch {epoch} | "
             f"train total={tr['total']:.4f} stft={tr['stft']:.4f} bf={tr['bf']:.4f} | "
             f"val total={vl['total']:.4f} stft={vl['stft']:.4f} bf={vl['bf']:.4f} | "
-            f"{elapsed:.0f}s")
+            f"{elapsed:.0f}s"
+        )
 
         scheduler.step(vl["total"])
         history["train"].append(tr)
         history["val"].append(vl)
 
-        # Update loss curve plot
         best_ep = int(np.argmin([h["total"] for h in history["val"]])) + 1
         plot_loss_curves(history, exp_dir / "loss_curves.png", best_epoch=best_ep)
 
-        # Save checkpoints
         ckpt_out = {
             "epoch":     epoch,
             "encoder":   enc.state_dict(),
@@ -589,9 +672,8 @@ def main():
         if vl["total"] < best_val:
             best_val = vl["total"]
             torch.save(ckpt_out, exp_dir / "best_valid_loss.pth")
-            log(f"  ** New best val loss: {best_val:.4f}  -> saved best_valid_loss.pth")
+            logger.info(f"  ** New best val loss: {best_val:.4f}  -> saved best_valid_loss.pth")
 
-        # Append to loss CSV
         csv_path = exp_dir / "loss_history.csv"
         write_header = not csv_path.exists()
         with open(csv_path, "a") as fcsv:
@@ -602,8 +684,7 @@ def main():
                 f"{vl['total']:.6f},{vl['stft']:.6f},{vl['bf']:.6f}\n"
             )
 
-    log(f"\nTraining complete. Best val loss: {best_val:.4f}")
-    log_fh.close()
+    logger.info(f"\nTraining complete. Best val loss: {best_val:.4f}")
 
 
 if __name__ == "__main__":
@@ -611,5 +692,5 @@ if __name__ == "__main__":
         main()
     except Exception:
         msg = traceback.format_exc()
-        print(msg, file=sys.stderr)
+        logger.error(f"[FATAL] {msg}")
         sys.exit(1)
