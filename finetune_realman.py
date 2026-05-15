@@ -22,7 +22,9 @@ import argparse
 import json
 import logging
 import os
+import re
 import random
+import shutil
 import sys
 import time
 import traceback
@@ -614,10 +616,40 @@ def main():
             for item in batch:
                 yield item
 
-    best_val = float("inf")
-    history  = {"train": [], "val": []}
+    # ------------------------------------------------------------------ #
+    # Checkpoint resume: find latest {N}epoch.pth and restore all state  #
+    # ------------------------------------------------------------------ #
+    best_val  = float("inf")
+    history   = {"train": [], "val": []}
+    start_epoch = 1
+    best_ckpt_path = None   # absolute path of current best checkpoint
+    last_ckpt_path = None   # absolute path of last-saved checkpoint
 
-    for epoch in range(1, ft["epochs"] + 1):
+    ckpt_files = sorted(
+        [f for f in exp_dir.iterdir() if re.fullmatch(r"\d+epoch\.pth", f.name)],
+        key=lambda f: int(re.findall(r"\d+", f.name)[0]),
+    )
+    if ckpt_files:
+        resume_path = ckpt_files[-1].resolve()
+        logger.info(f"Resuming from checkpoint: {resume_path.name}")
+        ckpt = torch.load(str(resume_path), map_location="cpu")
+        enc.load_state_dict(ckpt["encoder"])
+        dec.load_state_dict(ckpt["decoder"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        start_epoch  = ckpt["epoch"] + 1
+        best_val     = ckpt["best_val"]
+        history      = ckpt["history"]
+        last_ckpt_path = str(resume_path)
+        saved_best = ckpt.get("best_ckpt_path")
+        best_ckpt_path = str(Path(saved_best).resolve()) if saved_best else str(resume_path)
+        logger.info(f"  last={resume_path.name}  best={Path(best_ckpt_path).name}  "
+                    f"start_epoch={start_epoch}  best_val={best_val:.4f}")
+
+    # ------------------------------------------------------------------ #
+    # Training loop                                                        #
+    # ------------------------------------------------------------------ #
+    for epoch in range(start_epoch, ft["epochs"] + 1):
         t0 = time.time()
         logger.info(f"\n=== Epoch {epoch}/{ft['epochs']}  (lr={optimizer.param_groups[0]['lr']:.2e}) ===")
 
@@ -660,20 +692,43 @@ def main():
         best_ep = int(np.argmin([h["total"] for h in history["val"]])) + 1
         plot_loss_curves(history, exp_dir / "loss_curves.png", best_epoch=best_ep)
 
-        ckpt_out = {
-            "epoch":     epoch,
-            "encoder":   enc.state_dict(),
-            "decoder":   dec.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "val_loss":  vl["total"],
-        }
-        torch.save(ckpt_out, exp_dir / "latest.pth")
-        if vl["total"] < best_val:
+        # ---------- determine if this epoch is new best ----------
+        is_new_best = vl["total"] < best_val
+        if is_new_best:
             best_val = vl["total"]
-            torch.save(ckpt_out, exp_dir / "best_valid_loss.pth")
-            logger.info(f"  ** New best val loss: {best_val:.4f}  -> saved best_valid_loss.pth")
+            logger.info(f"  ** New best val loss: {best_val:.4f}")
 
+        # ---------- save current checkpoint as {epoch}epoch.pth ----------
+        current_ckpt_path = str((exp_dir / f"{epoch}epoch.pth").resolve())
+        ckpt_out = {
+            "epoch":          epoch,
+            "encoder":        enc.state_dict(),
+            "decoder":        dec.state_dict(),
+            "optimizer":      optimizer.state_dict(),
+            "scheduler":      scheduler.state_dict(),
+            "best_val":       best_val,
+            "history":        history,
+            "best_ckpt_path": current_ckpt_path if is_new_best else best_ckpt_path,
+        }
+        torch.save(ckpt_out, current_ckpt_path)
+
+        # ---------- cleanup: delete last ckpt if it is not best ----------
+        if last_ckpt_path and last_ckpt_path != best_ckpt_path:
+            if os.path.exists(last_ckpt_path):
+                os.remove(last_ckpt_path)
+                logger.info(f"  removed old latest: {Path(last_ckpt_path).name}")
+
+        # ---------- update best pointer (delete old best if superseded) ----------
+        if is_new_best:
+            if best_ckpt_path and best_ckpt_path != current_ckpt_path:
+                if os.path.exists(best_ckpt_path):
+                    os.remove(best_ckpt_path)
+                    logger.info(f"  removed old best: {Path(best_ckpt_path).name}")
+            best_ckpt_path = current_ckpt_path
+
+        last_ckpt_path = current_ckpt_path
+
+        # ---------- loss CSV ----------
         csv_path = exp_dir / "loss_history.csv"
         write_header = not csv_path.exists()
         with open(csv_path, "a") as fcsv:
@@ -683,6 +738,12 @@ def main():
                 f"{epoch},{tr['total']:.6f},{tr['stft']:.6f},{tr['bf']:.6f},"
                 f"{vl['total']:.6f},{vl['stft']:.6f},{vl['bf']:.6f}\n"
             )
+
+    # ---------- finalize: copy best to best_valid_loss.pth ----------
+    if best_ckpt_path and os.path.exists(best_ckpt_path):
+        dst = str(exp_dir / "best_valid_loss.pth")
+        shutil.copy(best_ckpt_path, dst)
+        logger.info(f"Copied {Path(best_ckpt_path).name} -> best_valid_loss.pth")
 
     logger.info(f"\nTraining complete. Best val loss: {best_val:.4f}")
 
