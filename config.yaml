@@ -1,7 +1,7 @@
 # ================= Audio Settings =================
 audio:
   sample_rate: 16000
-  segment_length: 1.0  # 训练时裁剪的音频长度(秒)
+  segment_length: 4.0
 
 # ================= Data Paths =================
 dataset:
@@ -11,11 +11,14 @@ dataset:
 
 # ================= Training Settings =================
 train:
-  exp_dir: "./exp"
+  exp_dir: "exp/phase_finetune/v2"
   batch_size: 4
   num_workers: 4
-  epochs: 100
-  learning_rate: 0.001
+  epochs: 150
+  learning_rate: 1.0e-03
+  lr_factor: 0.5
+  lr_patience: 5
+  min_lr: 1.0e-09
   grad_clip: 5.0
   log_interval: 100
   seed: 42
@@ -37,13 +40,76 @@ model:
   decoder_init: "idft"
 
 # ================= Loss Weights =================
-# 这里的权重将在 train.py 中被调用进行加权计算
 loss:
-  multi_res_weight: 20.0
-  resolution_weights: [] # 如果为空，则使用均等权重
-  recon_weight: 200.0
-  gompsnr_weight: 10.0
-  wop_weight: 1.0
-  cori_weight: 1.0
-  wop_alpha: 100
-  mag_dist_type: "L1"
+  mask_type: "none" 
+  multi_res_weight: 
+    weight: 300.0
+    resolution_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    real_weight: 10.0
+    imag_weight: 10.0
+    mag_weight: 10.0
+  gompsnr_weight:
+    weight: 100.0
+    wop_weight: 1.0
+    cori_weight: 5.0
+    wop_alpha: 100
+    mag_dist_type: "L1"
+  recon_weight: 100.0
+  sisnr_weight: 0.0
+  entropy_weight: 0.0
+  tv_weight: 0.0
+ 
+# ================= Inference Settings =================
+inference:
+  dnsmos_dir: "./dnsmos" 
+  output_filename: "test_metrics.csv"
+  save_audio: false
+
+# ================= Visualization Settings =================
+visualization:
+  test_audio_path: "../egs2/vctk_noisy/enh1/dump/raw/tt_2spk/data/wav/format.1/p232_001.flac"
+  zoom_start: 0.70
+  zoom_end: 0.80
+  plot_items: ['pred', 'target']
+
+# ================= Phase Fine-tuning (RealMAN) =================
+phase_finetune:
+  data_root: "/gpfs/sjtu/audiocc/data/import/RealMAN"
+  pretrain_ckpt: "exp/v6-4/best_valid_loss.pth"
+  pretrain_config: "exp/v6-4/config.yaml"
+  exp_dir: "exp/phase_finetune/v5"
+
+  # Training hyperparameters
+  epochs: 40
+  learning_rate: 1.0e-04
+  lr_factor: 0.5
+  lr_patience: 5
+  min_lr: 1.0e-07
+  grad_clip: 5.0
+  log_interval: 500
+  seed: 42
+  num_workers: 8
+
+  # Data settings
+  sr: 16000
+  seg_len: 2.0
+  min_ch: 2
+  max_ch: 8
+  snr_min: -5.0
+  snr_max: 20.0
+
+  # Step limit per epoch
+  max_steps_per_epoch: 5000
+
+  # Loss settings (v5)
+  # cross_weight: 归一化复数互功率谱 loss 权重
+  #   raw cross_loss 范围 [0, 2]（相干函数），HybridLoss ~0.003
+  #   cross_weight=1.0 使 cross loss 在训练初期成为主要梯度来源
+  bf_weight: 0.0
+  cross_weight: 1.0
+
+  # Validation: rooms held out from training (one per acoustic category)
+  val_rooms:
+    - Cafeteria2
+    - Park
+    - Car-Electric

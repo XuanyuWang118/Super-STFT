@@ -2,17 +2,25 @@
 """
 Fine-tune SuperRes encoder+decoder on RealMAN 32-mic dataset.
 
-Objective: improve inter-channel phase coherence for beamforming.
+Objective: restore inter-channel phase coherence for MVDR beamforming.
 
-Training procedure per sample:
+Root-cause (confirmed by Test A-E diagnostics, 2026-05-19):
+  Even with STFT-optimal MVDR weights, encoder features only yield 8.56 dB
+  vs 14.54 dB STFT baseline (-5.98 dB). The encoder corrupts per-bin
+  inter-channel spatial information. IRM quality loss is negligible (-0.78 dB).
+
+Training procedure per sample (v5):
   1. Random 2-N channels of clean speech (ma_speech, same room)
   2. Same channel indices from a noise recording (ma_noise, same room)
   3. Scale noise to random SNR, add to speech -> noisy mix
   4. Encode S=enc(speech), N=enc(noise), X=enc(mix)
-  5. IRM(S,N) -> MVDR_Souden on X -> enhanced Y  (F, T_f)
-  6. HybridSupervisionLoss on (S, speech), (N, noise), (X, mix)
-  7. L1 loss: dec(Y) vs dec(S[ref_ch])
-  8. Backprop enc + dec
+  5. HybridSupervisionLoss on (S, speech), (N, noise), (X, mix)  [3x per-ch alignment]
+  6. CrossCovLoss: normalized cross-spectrum enc(S)_i*enc(S)_j* vs stft(S)_i*stft(S)_j*
+  7. Backprop enc + dec
+
+v5 vs v4:
+  - Step 6 (CrossCovLoss) is NEW: directly penalizes inter-channel phase errors.
+  - bf_weight=0 (bf L1 loss remains off).
 
 Usage:
   python finetune_realman.py --config config.yaml
@@ -249,6 +257,47 @@ def encode_mc(wav_mc: torch.Tensor, enc: SuperResEncoder) -> torch.Tensor:
     return enc(wav_mc.unsqueeze(1))
 
 
+def stft_mc(wav_mc: torch.Tensor, n_fft: int, hop: int) -> torch.Tensor:
+    """(C, T) -> (C, F, T_f) complex  — reference STFT for all channels."""
+    win = torch.hann_window(n_fft, device=wav_mc.device)
+    return torch.stack([
+        torch.stft(wav_mc[c], n_fft=n_fft, hop_length=hop, win_length=n_fft,
+                   window=win, return_complex=True, pad_mode="reflect")
+        for c in range(wav_mc.shape[0])
+    ])  # (C, F, T_f)
+
+
+def cross_cov_loss(
+    S_enc: torch.Tensor,   # (C, F, T_f) complex — encoder output
+    S_stft: torch.Tensor,  # (C, F, T_f) complex — STFT reference (same TF grid)
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Normalized cross-spectrum coherence loss over all channel pairs.
+
+    For each pair (i, j):
+        norm_enc  = enc_i * enc_j* / (|enc_i| * |enc_j| + eps)
+        norm_stft = stft_i * stft_j* / (|stft_i| * |stft_j| + eps)
+        loss += mean(|norm_enc - norm_stft|^2)
+
+    This is scale-invariant and directly measures inter-channel phase
+    structure deviation — the root cause identified by Test E.
+    """
+    C = S_enc.shape[0]
+    loss = S_enc.new_zeros(1, dtype=torch.float32)
+    n_pairs = 0
+    for i in range(C):
+        for j in range(i + 1, C):
+            # Normalized cross-spectra (coherence)
+            nc = (S_enc[i]  * S_enc[j].conj()  /
+                  (S_enc[i].abs()  * S_enc[j].abs()  + eps))
+            ns = (S_stft[i] * S_stft[j].conj() /
+                  (S_stft[i].abs() * S_stft[j].abs() + eps))
+            diff = nc - ns
+            loss = loss + diff.real.pow(2).mean() + diff.imag.pow(2).mean()
+            n_pairs += 1
+    return loss / max(n_pairs, 1)
+
+
 def irm_beamform(
     S: torch.Tensor,   # (C, F, T_f) complex
     N: torch.Tensor,   # (C, F, T_f) complex
@@ -281,8 +330,10 @@ def irm_beamform(
 # One training step
 # -----------------------------------------------------------------------
 
-def process_sample(enc, dec, hybrid_loss, sample, device, bf_weight: float):
-    """Returns (loss, stft_loss, bf_loss) as scalar tensors."""
+def process_sample(enc, dec, hybrid_loss, sample, device,
+                   bf_weight: float, cross_weight: float,
+                   n_fft: int, hop: int):
+    """Returns (loss, stft_loss, cross_loss, bf_loss) as scalar tensors."""
     speech_mc, noise_mc, mix_mc = [x.to(device) for x in sample]
     C, T = speech_mc.shape
 
@@ -292,14 +343,22 @@ def process_sample(enc, dec, hybrid_loss, sample, device, bf_weight: float):
     X_ri = encode_mc(mix_mc,    enc)
 
     # HybridSupervisionLoss on each signal independently.
-    # Outer multi_res_weight (300×) from pretraining is intentionally not applied
-    # here; fine-tuning uses the raw normalized internal loss.
     loss_S, _ = hybrid_loss(S_ri, speech_mc.unsqueeze(1))
     loss_N, _ = hybrid_loss(N_ri, noise_mc.unsqueeze(1))
     loss_X, _ = hybrid_loss(X_ri, mix_mc.unsqueeze(1))
     stft_loss = loss_S + loss_N + loss_X
 
-    # Beamforming loss
+    # Cross-channel covariance loss (v5: core new term)
+    cross_loss = torch.tensor(0.0, device=device)
+    if cross_weight > 0.0 and C >= 2:
+        S_enc_c  = torch.view_as_complex(S_ri.contiguous())          # (C, F, T_f)
+        S_stft_c = stft_mc(speech_mc, n_fft, hop)                    # (C, F, T_f)
+        # Crop to same time length (encoder padding may differ slightly)
+        min_t = min(S_enc_c.shape[2], S_stft_c.shape[2])
+        cross_loss = cross_cov_loss(S_enc_c[:, :, :min_t],
+                                    S_stft_c[:, :, :min_t])
+
+    # Beamforming loss (kept for completeness; off by default via bf_weight=0)
     bf_loss = torch.tensor(0.0, device=device)
     if bf_weight > 0.0:
         try:
@@ -316,8 +375,8 @@ def process_sample(enc, dec, hybrid_loss, sample, device, bf_weight: float):
         except Exception:
             logger.warning(f"    bf step failed: {traceback.format_exc()}")
 
-    loss = stft_loss + bf_weight * bf_loss
-    return loss, stft_loss, bf_loss
+    loss = stft_loss + cross_weight * cross_loss + bf_weight * bf_loss
+    return loss, stft_loss, cross_loss, bf_loss
 
 
 # -----------------------------------------------------------------------
@@ -325,11 +384,11 @@ def process_sample(enc, dec, hybrid_loss, sample, device, bf_weight: float):
 # -----------------------------------------------------------------------
 
 def run_epoch(enc, dec, hybrid_loss, optimizer, samples, device,
-              is_train, grad_clip, bf_weight, log_interval=200,
-              total_samples=None, max_steps=None):
+              is_train, grad_clip, bf_weight, cross_weight, n_fft, hop,
+              log_interval=200, total_samples=None, max_steps=None):
     enc.train(is_train); dec.train(is_train)
 
-    totals = dict(total=0.0, stft=0.0, bf=0.0)
+    totals = dict(total=0.0, stft=0.0, cross=0.0, bf=0.0)
     n = 0
     t0 = time.time()
     cap = min(max_steps, total_samples) if (max_steps and total_samples) else (max_steps or total_samples)
@@ -341,8 +400,10 @@ def run_epoch(enc, dec, hybrid_loss, optimizer, samples, device,
             if i == 0:
                 logger.info("  first batch received")
             t_step = time.time()
-            loss, sl, bl = process_sample(
-                enc, dec, hybrid_loss, sample, device, bf_weight
+            loss, sl, cl, bl = process_sample(
+                enc, dec, hybrid_loss, sample, device,
+                bf_weight=bf_weight, cross_weight=cross_weight,
+                n_fft=n_fft, hop=hop,
             )
             if i == 0:
                 logger.info(f"  first sample done in {time.time()-t_step:.2f}s")
@@ -354,6 +415,7 @@ def run_epoch(enc, dec, hybrid_loss, optimizer, samples, device,
 
             totals["total"] += loss.item()
             totals["stft"]  += sl.item()
+            totals["cross"] += cl.item() if isinstance(cl, torch.Tensor) else float(cl)
             totals["bf"]    += bl.item() if isinstance(bl, torch.Tensor) else float(bl)
             n += 1
 
@@ -371,6 +433,7 @@ def run_epoch(enc, dec, hybrid_loss, optimizer, samples, device,
                     f"  {progress} "
                     f"total={totals['total']/n:.4f}  "
                     f"stft={totals['stft']/n:.4f}  "
+                    f"cross={totals['cross']/n:.4f}  "
                     f"bf={totals['bf']/n:.4f}  "
                     f"avg={avg:.2f}s/sample{eta_str}"
                 )
@@ -391,13 +454,14 @@ def plot_loss_curves(history: dict, save_path: Path, best_epoch: int = None):
     metrics = [
         ("total", "Total Loss"),
         ("stft",  "STFT Alignment Loss"),
+        ("cross", "Cross-Cov Loss (raw)"),
         ("bf",    "Beamforming L1 Loss"),
     ]
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    fig.suptitle("Phase Fine-tune Loss Curves", fontsize=13)
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4))
+    fig.suptitle("Phase Fine-tune Loss Curves (v5)", fontsize=13)
     for ax, (key, title) in zip(axes, metrics):
-        tr_vals = [h[key] for h in history["train"]]
-        vl_vals = [h[key] for h in history["val"]]
+        tr_vals = [h.get(key, 0.0) for h in history["train"]]
+        vl_vals = [h.get(key, 0.0) for h in history["val"]]
         ax.plot(epochs, tr_vals, color="tab:red",  label="Train", linewidth=1.5)
         ax.plot(epochs, vl_vals, color="tab:blue", label="Val",   linewidth=1.5, linestyle="--")
         if best_epoch is not None:
@@ -512,7 +576,8 @@ def load_ft_config(yaml_path: str) -> dict:
         lr_patience=5, min_lr=1e-7, grad_clip=5.0,
         log_interval=200, seed=42, num_workers=8,
         sr=16000, seg_len=2.0, min_ch=2, max_ch=8,
-        snr_min=-5.0, snr_max=20.0, bf_weight=1.0,
+        snr_min=-5.0, snr_max=20.0, bf_weight=0.0,
+        cross_weight=1.0,
         max_steps_per_epoch=None,
         val_rooms=["Cafeteria2", "Park", "Car-Electric"],
     )
@@ -658,7 +723,10 @@ def main():
             tr = run_epoch(enc, dec, hybrid_loss, optimizer,
                            iter_samples(train_loader), device,
                            is_train=True, grad_clip=ft["grad_clip"],
-                           bf_weight=ft["bf_weight"], log_interval=ft["log_interval"],
+                           bf_weight=ft["bf_weight"],
+                           cross_weight=ft["cross_weight"],
+                           n_fft=cfg.base_win_len, hop=cfg.base_hop_len,
+                           log_interval=ft["log_interval"],
                            total_samples=len(train_ds),
                            max_steps=ft.get("max_steps_per_epoch"))
         except Exception:
@@ -670,7 +738,10 @@ def main():
             vl = run_epoch(enc, dec, hybrid_loss, None,
                            iter_samples(val_loader), device,
                            is_train=False, grad_clip=ft["grad_clip"],
-                           bf_weight=ft["bf_weight"], log_interval=0,
+                           bf_weight=ft["bf_weight"],
+                           cross_weight=ft["cross_weight"],
+                           n_fft=cfg.base_win_len, hop=cfg.base_hop_len,
+                           log_interval=0,
                            total_samples=len(val_ds),
                            max_steps=ft.get("max_steps_per_epoch"))
         except Exception:
@@ -680,8 +751,10 @@ def main():
         elapsed = time.time() - t0
         logger.info(
             f"  Epoch {epoch} | "
-            f"train total={tr['total']:.4f} stft={tr['stft']:.4f} bf={tr['bf']:.4f} | "
-            f"val total={vl['total']:.4f} stft={vl['stft']:.4f} bf={vl['bf']:.4f} | "
+            f"train total={tr['total']:.4f} stft={tr['stft']:.4f} "
+            f"cross={tr['cross']:.4f} bf={tr['bf']:.4f} | "
+            f"val total={vl['total']:.4f} stft={vl['stft']:.4f} "
+            f"cross={vl['cross']:.4f} bf={vl['bf']:.4f} | "
             f"{elapsed:.0f}s"
         )
 
@@ -733,10 +806,13 @@ def main():
         write_header = not csv_path.exists()
         with open(csv_path, "a") as fcsv:
             if write_header:
-                fcsv.write("epoch,tr_total,tr_stft,tr_bf,vl_total,vl_stft,vl_bf\n")
+                fcsv.write("epoch,tr_total,tr_stft,tr_cross,tr_bf,"
+                           "vl_total,vl_stft,vl_cross,vl_bf\n")
             fcsv.write(
-                f"{epoch},{tr['total']:.6f},{tr['stft']:.6f},{tr['bf']:.6f},"
-                f"{vl['total']:.6f},{vl['stft']:.6f},{vl['bf']:.6f}\n"
+                f"{epoch},{tr['total']:.6f},{tr['stft']:.6f},"
+                f"{tr['cross']:.6f},{tr['bf']:.6f},"
+                f"{vl['total']:.6f},{vl['stft']:.6f},"
+                f"{vl['cross']:.6f},{vl['bf']:.6f}\n"
             )
 
     # ---------- finalize: copy best to best_valid_loss.pth ----------
