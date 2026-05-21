@@ -257,45 +257,6 @@ def encode_mc(wav_mc: torch.Tensor, enc: SuperResEncoder) -> torch.Tensor:
     return enc(wav_mc.unsqueeze(1))
 
 
-def stft_mc(wav_mc: torch.Tensor, n_fft: int, hop: int) -> torch.Tensor:
-    """(C, T) -> (C, F, T_f) complex  — reference STFT for all channels."""
-    win = torch.hann_window(n_fft, device=wav_mc.device)
-    return torch.stack([
-        torch.stft(wav_mc[c], n_fft=n_fft, hop_length=hop, win_length=n_fft,
-                   window=win, return_complex=True, pad_mode="reflect")
-        for c in range(wav_mc.shape[0])
-    ])  # (C, F, T_f)
-
-
-def cross_cov_loss(
-    S_enc: torch.Tensor,   # (C, F, T_f) complex — encoder output
-    S_stft: torch.Tensor,  # (C, F, T_f) complex — STFT reference (same TF grid)
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    """Normalized cross-spectrum coherence loss over all channel pairs.
-
-    For each pair (i, j):
-        norm_enc  = enc_i * enc_j* / (|enc_i| * |enc_j| + eps)
-        norm_stft = stft_i * stft_j* / (|stft_i| * |stft_j| + eps)
-        loss += mean(|norm_enc - norm_stft|^2)
-
-    This is scale-invariant and directly measures inter-channel phase
-    structure deviation — the root cause identified by Test E.
-    """
-    C = S_enc.shape[0]
-    loss = S_enc.new_zeros(1, dtype=torch.float32)
-    n_pairs = 0
-    for i in range(C):
-        for j in range(i + 1, C):
-            # Normalized cross-spectra (coherence)
-            nc = (S_enc[i]  * S_enc[j].conj()  /
-                  (S_enc[i].abs()  * S_enc[j].abs()  + eps))
-            ns = (S_stft[i] * S_stft[j].conj() /
-                  (S_stft[i].abs() * S_stft[j].abs() + eps))
-            diff = nc - ns
-            loss = loss + diff.real.pow(2).mean() + diff.imag.pow(2).mean()
-            n_pairs += 1
-    return loss / max(n_pairs, 1)
 
 
 def irm_beamform(
@@ -331,9 +292,10 @@ def irm_beamform(
 # -----------------------------------------------------------------------
 
 def process_sample(enc, dec, hybrid_loss, sample, device,
-                   bf_weight: float, cross_weight: float,
-                   n_fft: int, hop: int):
-    """Returns (loss, stft_loss, cross_loss, bf_loss) as scalar tensors."""
+                   bf_weight: float,
+                   speech_weight: float, noise_weight: float, mix_weight: float):
+    """Returns (loss, stft_loss, bf_loss, loss_S, loss_N, loss_X,
+                details_S, details_N, details_X)."""
     speech_mc, noise_mc, mix_mc = [x.to(device) for x in sample]
     C, T = speech_mc.shape
 
@@ -343,22 +305,12 @@ def process_sample(enc, dec, hybrid_loss, sample, device,
     X_ri = encode_mc(mix_mc,    enc)
 
     # HybridSupervisionLoss on each signal independently.
-    loss_S, _ = hybrid_loss(S_ri, speech_mc.unsqueeze(1))
-    loss_N, _ = hybrid_loss(N_ri, noise_mc.unsqueeze(1))
-    loss_X, _ = hybrid_loss(X_ri, mix_mc.unsqueeze(1))
-    stft_loss = loss_S + loss_N + loss_X
+    loss_S, details_S = hybrid_loss(S_ri, speech_mc.unsqueeze(1))
+    loss_N, details_N = hybrid_loss(N_ri, noise_mc.unsqueeze(1))
+    loss_X, details_X = hybrid_loss(X_ri, mix_mc.unsqueeze(1))
+    stft_loss = speech_weight * loss_S + noise_weight * loss_N + mix_weight * loss_X
 
-    # Cross-channel covariance loss (v5: core new term)
-    cross_loss = torch.tensor(0.0, device=device)
-    if cross_weight > 0.0 and C >= 2:
-        S_enc_c  = torch.view_as_complex(S_ri.contiguous())          # (C, F, T_f)
-        S_stft_c = stft_mc(speech_mc, n_fft, hop)                    # (C, F, T_f)
-        # Crop to same time length (encoder padding may differ slightly)
-        min_t = min(S_enc_c.shape[2], S_stft_c.shape[2])
-        cross_loss = cross_cov_loss(S_enc_c[:, :, :min_t],
-                                    S_stft_c[:, :, :min_t])
-
-    # Beamforming loss (kept for completeness; off by default via bf_weight=0)
+    # Beamforming loss (off by default via bf_weight=0)
     bf_loss = torch.tensor(0.0, device=device)
     if bf_weight > 0.0:
         try:
@@ -375,8 +327,8 @@ def process_sample(enc, dec, hybrid_loss, sample, device,
         except Exception:
             logger.warning(f"    bf step failed: {traceback.format_exc()}")
 
-    loss = stft_loss + cross_weight * cross_loss + bf_weight * bf_loss
-    return loss, stft_loss, cross_loss, bf_loss
+    loss = stft_loss + bf_weight * bf_loss
+    return loss, stft_loss, bf_loss, loss_S, loss_N, loss_X, details_S, details_N, details_X
 
 
 # -----------------------------------------------------------------------
@@ -384,11 +336,17 @@ def process_sample(enc, dec, hybrid_loss, sample, device,
 # -----------------------------------------------------------------------
 
 def run_epoch(enc, dec, hybrid_loss, optimizer, samples, device,
-              is_train, grad_clip, bf_weight, cross_weight, n_fft, hop,
+              is_train, grad_clip, bf_weight,
+              speech_weight, noise_weight, mix_weight,
               log_interval=200, total_samples=None, max_steps=None):
     enc.train(is_train); dec.train(is_train)
 
-    totals = dict(total=0.0, stft=0.0, cross=0.0, bf=0.0)
+    totals = dict(
+        total=0.0, stft=0.0, bf=0.0,
+        S_total=0.0, S_mag=0.0, S_real=0.0, S_imag=0.0,
+        N_total=0.0, N_mag=0.0, N_real=0.0, N_imag=0.0,
+        X_total=0.0, X_mag=0.0, X_real=0.0, X_imag=0.0,
+    )
     n = 0
     t0 = time.time()
     cap = min(max_steps, total_samples) if (max_steps and total_samples) else (max_steps or total_samples)
@@ -400,10 +358,12 @@ def run_epoch(enc, dec, hybrid_loss, optimizer, samples, device,
             if i == 0:
                 logger.info("  first batch received")
             t_step = time.time()
-            loss, sl, cl, bl = process_sample(
+            loss, sl, bl, loss_S, loss_N, loss_X, ds, dn, dx = process_sample(
                 enc, dec, hybrid_loss, sample, device,
-                bf_weight=bf_weight, cross_weight=cross_weight,
-                n_fft=n_fft, hop=hop,
+                bf_weight=bf_weight,
+                speech_weight=speech_weight,
+                noise_weight=noise_weight,
+                mix_weight=mix_weight,
             )
             if i == 0:
                 logger.info(f"  first sample done in {time.time()-t_step:.2f}s")
@@ -415,8 +375,14 @@ def run_epoch(enc, dec, hybrid_loss, optimizer, samples, device,
 
             totals["total"] += loss.item()
             totals["stft"]  += sl.item()
-            totals["cross"] += cl.item() if isinstance(cl, torch.Tensor) else float(cl)
             totals["bf"]    += bl.item() if isinstance(bl, torch.Tensor) else float(bl)
+            totals["S_total"] += loss_S.item()
+            totals["N_total"] += loss_N.item()
+            totals["X_total"] += loss_X.item()
+            for prefix, det in (("S", ds), ("N", dn), ("X", dx)):
+                totals[f"{prefix}_mag"]  += det.get("loss_mag",  0.0)
+                totals[f"{prefix}_real"] += det.get("loss_real", 0.0)
+                totals[f"{prefix}_imag"] += det.get("loss_imag", 0.0)
             n += 1
 
             if log_interval > 0 and n % log_interval == 0:
@@ -431,10 +397,9 @@ def run_epoch(enc, dec, hybrid_loss, optimizer, samples, device,
                     progress = f"[{n}]"
                 logger.info(
                     f"  {progress} "
-                    f"total={totals['total']/n:.4f}  "
-                    f"stft={totals['stft']/n:.4f}  "
-                    f"cross={totals['cross']/n:.4f}  "
-                    f"bf={totals['bf']/n:.4f}  "
+                    f"total={totals['total']/n:.4f}  stft={totals['stft']/n:.4f}  "
+                    f"S(tot={totals['S_total']/n:.4f} mag={totals['S_mag']/n:.4f} "
+                    f"re={totals['S_real']/n:.4f} im={totals['S_imag']/n:.4f})  "
                     f"avg={avg:.2f}s/sample{eta_str}"
                 )
 
@@ -450,29 +415,52 @@ def run_epoch(enc, dec, hybrid_loss, optimizer, samples, device,
 # -----------------------------------------------------------------------
 
 def plot_loss_curves(history: dict, save_path: Path, best_epoch: int = None):
-    epochs  = list(range(1, len(history["train"]) + 1))
-    metrics = [
-        ("total", "Total Loss"),
-        ("stft",  "STFT Alignment Loss"),
-        ("cross", "Cross-Cov Loss (raw)"),
-        ("bf",    "Beamforming L1 Loss"),
+    epochs = list(range(1, len(history["train"]) + 1))
+
+    # Component style: color per metric, solid=train / dashed=val
+    comp_styles = [
+        ("total", "Total",   "black",       2.0),
+        ("mag",   "Mag",     "tab:blue",    1.0),
+        ("real",  "Real",    "tab:orange",  1.0),
+        ("imag",  "Imag",    "tab:green",   1.0),
     ]
-    fig, axes = plt.subplots(1, 4, figsize=(20, 4))
-    fig.suptitle("Phase Fine-tune Loss Curves (v5)", fontsize=13)
-    for ax, (key, title) in zip(axes, metrics):
-        tr_vals = [h.get(key, 0.0) for h in history["train"]]
-        vl_vals = [h.get(key, 0.0) for h in history["val"]]
-        ax.plot(epochs, tr_vals, color="tab:red",  label="Train", linewidth=1.5)
-        ax.plot(epochs, vl_vals, color="tab:blue", label="Val",   linewidth=1.5, linestyle="--")
-        if best_epoch is not None:
-            ax.axvline(best_epoch, color="gray", linestyle=":", linewidth=1.2,
-                       label=f"Best (ep{best_epoch})")
-        ax.set_title(title)
+
+    fig, axes = plt.subplots(1, 4, figsize=(24, 4.5))
+    fig.suptitle("HybridLoss Training Curves — S / N / X Component Breakdown", fontsize=12)
+
+    # --- subplot 0: overall total loss ---
+    ax = axes[0]
+    tr = [h.get("total", 0.0) for h in history["train"]]
+    vl = [h.get("total", 0.0) for h in history["val"]]
+    ax.plot(epochs, tr, color="tab:red",  linewidth=1.8, label="Train")
+    ax.plot(epochs, vl, color="tab:blue", linewidth=1.8, linestyle="--", label="Val")
+    if best_epoch:
+        ax.axvline(best_epoch, color="gray", linestyle=":", linewidth=1.0)
+    ax.set_title("Overall Total Loss")
+    ax.set_xlabel("Epoch")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+
+    # --- subplots 1-3: per-signal component breakdown ---
+    for ax, (prefix, signal_name) in zip(axes[1:], [("S", "Speech"), ("N", "Noise"), ("X", "Mix")]):
+        for comp, label, color, lw in comp_styles:
+            key = f"{prefix}_total" if comp == "total" else f"{prefix}_{comp}"
+            tr_vals = [h.get(key, 0.0) for h in history["train"]]
+            vl_vals = [h.get(key, 0.0) for h in history["val"]]
+            ax.plot(epochs, tr_vals, color=color, linewidth=lw,
+                    label=f"{label}·tr", alpha=0.9)
+            ax.plot(epochs, vl_vals, color=color, linewidth=max(lw - 0.3, 0.7),
+                    linestyle="--", label=f"{label}·vl", alpha=0.65)
+        if best_epoch:
+            ax.axvline(best_epoch, color="gray", linestyle=":", linewidth=1.0)
+        ax.set_title(f"Hybrid Loss — {signal_name} ({prefix})")
         ax.set_xlabel("Epoch")
         ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=8)
+        ax.legend(fontsize=6, ncol=2, loc="upper right",
+                  handlelength=1.5, columnspacing=0.8, labelspacing=0.3)
+
     plt.tight_layout()
-    plt.savefig(str(save_path), dpi=150)
+    plt.savefig(str(save_path), dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -577,7 +565,7 @@ def load_ft_config(yaml_path: str) -> dict:
         log_interval=200, seed=42, num_workers=8,
         sr=16000, seg_len=2.0, min_ch=2, max_ch=8,
         snr_min=-5.0, snr_max=20.0, bf_weight=0.0,
-        cross_weight=1.0,
+        speech_weight=1.0, noise_weight=1.0, mix_weight=1.0,
         max_steps_per_epoch=None,
         val_rooms=["Cafeteria2", "Park", "Car-Electric"],
     )
@@ -614,6 +602,14 @@ def main():
     logger.info(f"Config: {args.config}  [phase_finetune]")
     logger.info(f"Settings: {ft}")
 
+    # Back up only the phase_finetune section to the experiment directory
+    with open(args.config) as _f:
+        _raw_cfg = yaml.safe_load(_f)
+    _ft_only = {"phase_finetune": _raw_cfg.get("phase_finetune", {})}
+    with open(exp_dir / "config.yaml", "w") as _f:
+        yaml.dump(_ft_only, _f, default_flow_style=False, allow_unicode=True)
+    logger.info(f"Config backed up → {exp_dir / 'config.yaml'}")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
 
@@ -628,6 +624,17 @@ def main():
     hybrid_loss = HybridSupervisionLoss(cfg).to(device)
     for param in hybrid_loss.parameters():
         param.requires_grad_(False)
+
+    # Apply per-component weight overrides from finetune config (optional)
+    if "mag_weight_override" in ft:
+        hybrid_loss.config.mag_weight  = ft["mag_weight_override"]
+        logger.info(f"Override mag_weight  → {ft['mag_weight_override']}")
+    if "real_weight_override" in ft:
+        hybrid_loss.config.real_weight = ft["real_weight_override"]
+        logger.info(f"Override real_weight → {ft['real_weight_override']}")
+    if "imag_weight_override" in ft:
+        hybrid_loss.config.imag_weight = ft["imag_weight_override"]
+        logger.info(f"Override imag_weight → {ft['imag_weight_override']}")
 
     data_root  = Path(ft["data_root"])
     train_root = data_root / "train"
@@ -724,8 +731,9 @@ def main():
                            iter_samples(train_loader), device,
                            is_train=True, grad_clip=ft["grad_clip"],
                            bf_weight=ft["bf_weight"],
-                           cross_weight=ft["cross_weight"],
-                           n_fft=cfg.base_win_len, hop=cfg.base_hop_len,
+                           speech_weight=ft["speech_weight"],
+                           noise_weight=ft["noise_weight"],
+                           mix_weight=ft["mix_weight"],
                            log_interval=ft["log_interval"],
                            total_samples=len(train_ds),
                            max_steps=ft.get("max_steps_per_epoch"))
@@ -739,8 +747,9 @@ def main():
                            iter_samples(val_loader), device,
                            is_train=False, grad_clip=ft["grad_clip"],
                            bf_weight=ft["bf_weight"],
-                           cross_weight=ft["cross_weight"],
-                           n_fft=cfg.base_win_len, hop=cfg.base_hop_len,
+                           speech_weight=ft["speech_weight"],
+                           noise_weight=ft["noise_weight"],
+                           mix_weight=ft["mix_weight"],
                            log_interval=0,
                            total_samples=len(val_ds),
                            max_steps=ft.get("max_steps_per_epoch"))
@@ -751,10 +760,10 @@ def main():
         elapsed = time.time() - t0
         logger.info(
             f"  Epoch {epoch} | "
-            f"train total={tr['total']:.4f} stft={tr['stft']:.4f} "
-            f"cross={tr['cross']:.4f} bf={tr['bf']:.4f} | "
-            f"val total={vl['total']:.4f} stft={vl['stft']:.4f} "
-            f"cross={vl['cross']:.4f} bf={vl['bf']:.4f} | "
+            f"train total={tr['total']:.4f}  "
+            f"S(tot={tr['S_total']:.4f} mag={tr['S_mag']:.4f} re={tr['S_real']:.4f} im={tr['S_imag']:.4f}) | "
+            f"val total={vl['total']:.4f}  "
+            f"S(tot={vl['S_total']:.4f} mag={vl['S_mag']:.4f} re={vl['S_real']:.4f} im={vl['S_imag']:.4f}) | "
             f"{elapsed:.0f}s"
         )
 
@@ -806,14 +815,24 @@ def main():
         write_header = not csv_path.exists()
         with open(csv_path, "a") as fcsv:
             if write_header:
-                fcsv.write("epoch,tr_total,tr_stft,tr_cross,tr_bf,"
-                           "vl_total,vl_stft,vl_cross,vl_bf\n")
-            fcsv.write(
-                f"{epoch},{tr['total']:.6f},{tr['stft']:.6f},"
-                f"{tr['cross']:.6f},{tr['bf']:.6f},"
-                f"{vl['total']:.6f},{vl['stft']:.6f},"
-                f"{vl['cross']:.6f},{vl['bf']:.6f}\n"
-            )
+                fcsv.write(
+                    "epoch,"
+                    "tr_total,tr_stft,tr_bf,"
+                    "tr_S_total,tr_S_mag,tr_S_real,tr_S_imag,"
+                    "tr_N_total,tr_N_mag,tr_N_real,tr_N_imag,"
+                    "tr_X_total,tr_X_mag,tr_X_real,tr_X_imag,"
+                    "vl_total,vl_stft,vl_bf,"
+                    "vl_S_total,vl_S_mag,vl_S_real,vl_S_imag,"
+                    "vl_N_total,vl_N_mag,vl_N_real,vl_N_imag,"
+                    "vl_X_total,vl_X_mag,vl_X_real,vl_X_imag\n"
+                )
+            def _row(d):
+                keys = ["total", "stft", "bf",
+                        "S_total", "S_mag", "S_real", "S_imag",
+                        "N_total", "N_mag", "N_real", "N_imag",
+                        "X_total", "X_mag", "X_real", "X_imag"]
+                return ",".join(f"{d.get(k, 0.0):.6f}" for k in keys)
+            fcsv.write(f"{epoch},{_row(tr)},{_row(vl)}\n")
 
     # ---------- finalize: copy best to best_valid_loss.pth ----------
     if best_ckpt_path and os.path.exists(best_ckpt_path):
