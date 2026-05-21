@@ -2,29 +2,41 @@
 """
 Batch evaluation of non-neural beamformers on CHiME4 simu 6ch track data.
 
-Uses ideal IRM masks (oracle) and a pretrained SuperRes encoder/decoder
-in place of the standard STFT/iSTFT.
+Uses ideal IRM/IBM masks (oracle) with either:
+  - SuperRes encoder/decoder  (default)
+  - Standard STFT/iSTFT       (--use_stft, no model required)
 
 Noise is derived as: noise = mix - clean  (exact for simu data)
 Channel layout: CH1 CH3 CH4 CH5 CH6 → index 0 1 2 3 4; ref_channel=3 → CH5
 
+Output
+------
+  SuperRes : results written directly to checkpoint directory
+               {checkpoint_dir}/per_utt.csv
+               {checkpoint_dir}/summary.txt
+               {checkpoint_dir}/eval.log
+  STFT     : exp/stft/per_utt.csv  |  summary.txt  |  eval.log
+
 Usage
 -----
-    python test_beamformers_ideal.py \
-        --data_root /home/wangyou.zhang/espnet_my/egs2/chime4/enh1 \
-        --splits dt05 et05 \
-        --ref_channel 3 \
-        --config_yaml exp/v6-4/config.yaml \
-        --checkpoint  exp/v6-4/best_valid_loss.pth \
-        --output_dir  /tmp/enh_out
+  # SuperRes (fine-tuned model)
+  python test_beamformers_ideal.py \
+      --data_root  /path/to/chime4/enh1 \
+      --splits     tr05 dt05 et05 \
+      --config_yaml exp/phase_finetune/v1/config.yaml \
+      --checkpoint  exp/phase_finetune/v1/best_valid_loss.pth
 
-Note: the following user-supplied aliases are resolved automatically:
-  mvar  → mvdr   |   wmpd  → wmpdr   |   mwt → mwf
+  # STFT baseline (no model needed)
+  python test_beamformers_ideal.py --use_stft --splits tr05 dt05 et05
+
+Beamformer aliases resolved automatically:
+  mvar → mvdr  |  wmpd → wmpdr  |  mwt → mwf
 """
 
 import argparse
 import csv
 import datetime
+import logging
 import sys
 import time
 from pathlib import Path
@@ -253,6 +265,27 @@ def apply_beamformer(
 
 
 # ------------------------------------------------------------------ #
+# Logger
+# ------------------------------------------------------------------ #
+
+def setup_logger(log_path: Path) -> logging.Logger:
+    lg = logging.getLogger("bf_eval")
+    lg.setLevel(logging.DEBUG)
+    lg.propagate = False
+    fmt = logging.Formatter("%(message)s")
+    fh = logging.FileHandler(str(log_path), mode="w", encoding="utf-8")
+    fh.setFormatter(fmt)
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    lg.addHandler(fh)
+    lg.addHandler(sh)
+    return lg
+
+
+logger: logging.Logger = logging.getLogger("bf_eval")
+
+
+# ------------------------------------------------------------------ #
 # Argument parsing
 # ------------------------------------------------------------------ #
 
@@ -264,7 +297,7 @@ def parse_args():
     )
     p.add_argument("--data_root", default="/home/wangyou.zhang/espnet_my/egs2/chime4/enh1",
                    help="Root of the CHiME4 enh1 recipe")
-    p.add_argument("--splits", nargs="+", default=["dt05", "et05"],
+    p.add_argument("--splits", nargs="+", default=["tr05", "dt05", "et05"],
                    help="Which splits to evaluate (dt05, et05, tr05)")
     p.add_argument("--ref_channel", type=int, default=3,
                    help="Reference mic index in the 5-ch array (3 = CH5)")
@@ -397,50 +430,58 @@ def main():
     args = parse_args()
     device = torch.device(args.device)
 
-    # resolve aliases and drop multi-speaker-only types
+    # ---- resolve beamformer aliases, drop multi-speaker-only types ----
     bfs = []
     for b in args.beamformers:
         resolved = BF_ALIASES.get(b, b)
         if resolved in MULTI_SPK_ONLY:
-            print(f"[SKIP] {b} → {resolved} (multi-speaker only)")
+            print(f"[SKIP] {b} → {resolved} (multi-speaker only, skipped)")
             continue
-        if b != resolved:
-            print(f"[ALIAS] {b} → {resolved}")
         bfs.append(resolved)
 
-    # create timestamped results directory
-    mode    = "stft" if args.use_stft else "superres"
-    ts      = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    res_dir = Path(__file__).resolve().parent / "bf_eval" / f"eval_{mode}_{ts}"
+    # ---- output directory ----
+    # superres: directly in checkpoint's directory (exp/phase_finetune/v1/)
+    # stft:     exp/stft/ next to this script
+    if args.use_stft:
+        res_dir = Path(__file__).resolve().parent / "exp" / "stft"
+    else:
+        res_dir = Path(args.checkpoint).resolve().parent
     res_dir.mkdir(parents=True, exist_ok=True)
-    print(f"\nResults will be saved to: {res_dir}")
 
-    # load model or prepare STFT params
+    # ---- logger: stdout + eval.log ----
+    global logger
+    logger = setup_logger(res_dir / "eval.log")
+
+    logger.info(f"Results directory : {res_dir}")
+
+    # ---- load model or prepare STFT params ----
     if args.use_stft:
         enc = dec = None
-        n_fft = args.n_fft
-        hop   = args.hop_length
-        print(f"\nBaseline mode: standard STFT  n_fft={n_fft}  hop={hop}")
+        n_fft, hop = args.n_fft, args.hop_length
+        logger.info(f"\nBaseline mode: standard STFT  n_fft={n_fft}  hop={hop}")
     else:
-        print(f"\nLoading SuperRes model ...")
-        print(f"  config:     {args.config_yaml}")
-        print(f"  checkpoint: {args.checkpoint}")
+        logger.info(f"\nLoading SuperRes model ...")
+        logger.info(f"  config:     {args.config_yaml}")
+        logger.info(f"  checkpoint: {args.checkpoint}")
         enc, dec, cfg = load_model(args.config_yaml, args.checkpoint, device)
         n_fft = cfg.base_win_len
         hop   = cfg.base_hop_len
-        print(f"  base_win_len={n_fft}  base_hop_len={hop}  "
-              f"freq_bins={n_fft // 2 + 1}")
+        logger.info(f"  base_win_len={n_fft}  base_hop_len={hop}  "
+                    f"freq_bins={n_fft // 2 + 1}")
 
-    # ---- per-utterance records (for CSV) ----
-    # columns: utt_id, split, noise_cond, input_sisdr, <btype>...
+    logger.info(f"\nBeamformers : {bfs}")
+    logger.info(f"Splits      : {args.splits}")
+    logger.info(f"Mask type   : {args.mask_type.upper()}")
+    logger.info(f"Ref channel : {args.ref_channel}")
+
+    # ---- per-utterance records ----
     csv_path = res_dir / "per_utt.csv"
     csv_cols = ["utt_id", "split", "noise_cond", "input_sisdr"] + bfs
     csv_rows = []
 
-    # ---- accumulators keyed by (split, btype) and (cond, btype) ----
-    split_scores: dict = defaultdict(lambda: defaultdict(list))  # split → btype → [vals]
-    cond_scores:  dict = defaultdict(lambda: defaultdict(list))  # cond  → btype → [vals]
-    all_scores:   dict = defaultdict(list)                       # btype → [vals]
+    split_scores: dict = defaultdict(lambda: defaultdict(list))
+    cond_scores:  dict = defaultdict(lambda: defaultdict(list))
+    all_scores:   dict = defaultdict(list)
     split_input:  dict = defaultdict(list)
     cond_input:   dict = defaultdict(list)
     all_input:    list = []
@@ -452,7 +493,7 @@ def main():
         spk1_scp = scp_dir / "spk1.scp"
 
         if not wav_scp.exists() or not spk1_scp.exists():
-            print(f"\n[WARN] scp not found in {scp_dir}, skipping.")
+            logger.warning(f"\n[WARN] scp not found in {scp_dir}, skipping.")
             continue
 
         wav_dict  = parse_scp(str(wav_scp),  args.data_root)
@@ -461,13 +502,12 @@ def main():
         if args.max_utts:
             utt_ids = utt_ids[: args.max_utts]
 
-        print(f"\n{'=' * 60}")
-        print(f"Split: {split}  ({len(utt_ids)} utterances)")
-        print(f"{'=' * 60}")
+        logger.info(f"\n{'=' * 60}")
+        logger.info(f"Split: {split}  ({len(utt_ids)} utterances)")
+        logger.info(f"{'=' * 60}")
 
         t_split = time.perf_counter()
         for i, utt_id in enumerate(utt_ids):
-            # noise condition: e.g. "F01_050C0103_BUS_SIMU" → "BUS"
             parts = utt_id.upper().split("_")
             noise_cond = parts[-2] if len(parts) >= 2 else "UNK"
 
@@ -489,9 +529,9 @@ def main():
             else:
                 mask_s, mask_n = ideal_binary_mask(speech_stft, noise_stft)
 
-            ref = args.ref_channel
+            ref        = args.ref_channel
             speech_ref = speech_mc[ref]
-            in_si = si_sdr(mix_mc[ref], speech_ref)
+            in_si      = si_sdr(mix_mc[ref], speech_ref)
 
             all_input.append(in_si)
             split_input[split].append(in_si)
@@ -510,10 +550,8 @@ def main():
                         rtf_iter=args.rtf_iterations,
                         btaps=args.btaps, bdelay=args.bdelay,
                     )
-                    if args.use_stft:
-                        enh_wav = istft_ch(enh_stft, n_fft, hop, T)
-                    else:
-                        enh_wav = decode_ch(enh_stft, T, dec)
+                    enh_wav = (istft_ch(enh_stft, n_fft, hop, T)
+                               if args.use_stft else decode_ch(enh_stft, T, dec))
                     val = si_sdr(enh_wav, speech_ref)
 
                     if args.save_wav:
@@ -523,7 +561,7 @@ def main():
 
                 except Exception as exc:
                     val = float("nan")
-                    print(f"  [{utt_id}] {btype} FAILED: {exc}")
+                    logger.warning(f"  [{utt_id}] {btype} FAILED: {exc}")
 
                 all_scores[btype].append(val)
                 split_scores[split][btype].append(val)
@@ -536,10 +574,10 @@ def main():
                 elapsed = time.perf_counter() - t_split
                 avg = elapsed / (i + 1)
                 eta = avg * (len(utt_ids) - i - 1)
-                print(f"  {i + 1:4d}/{len(utt_ids)}"
-                      f"  elapsed={elapsed:.0f}s"
-                      f"  avg={avg:.1f}s/utt"
-                      f"  ETA={eta:.0f}s (~{eta/3600:.1f}h)")
+                logger.info(f"  {i+1:4d}/{len(utt_ids)}"
+                            f"  elapsed={elapsed:.0f}s"
+                            f"  avg={avg:.1f}s/utt"
+                            f"  ETA={eta:.0f}s (~{eta/3600:.1f}h)")
 
     # ------------------------------------------------------------------ #
     # Save per-utterance CSV
@@ -548,58 +586,52 @@ def main():
         writer = csv.DictWriter(f, fieldnames=csv_cols)
         writer.writeheader()
         writer.writerows(csv_rows)
-    print(f"\nPer-utterance scores → {csv_path}")
+    logger.info(f"\nPer-utterance scores → {csv_path}")
 
     # ------------------------------------------------------------------ #
-    # Build stats tables
+    # Build and save stats report
     # ------------------------------------------------------------------ #
     all_input_arr = np.array(all_input, dtype=float)
 
-    if args.use_stft:
-        tf_info = f"Standard STFT  n_fft={n_fft}  hop={hop}"
-    else:
-        tf_info = f"SuperRes encoder  n_fft={n_fft}  hop={hop}  ckpt={args.checkpoint}"
+    tf_info = (f"Standard STFT  n_fft={n_fft}  hop={hop}"
+               if args.use_stft
+               else f"SuperRes encoder  n_fft={n_fft}  hop={hop}  ckpt={args.checkpoint}")
 
     report_lines = [
-        f"Beamformer Evaluation Report",
+        "Beamformer Evaluation Report",
         f"Generated  : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"Mode       : {tf_info}",
         f"Splits     : {args.splits}",
         f"Mask type  : {args.mask_type.upper()}",
-        f"Ref ch     : {args.ref_channel}  (CH5)",
+        f"Ref ch     : {args.ref_channel}",
         f"Total utts : {len(all_input)}",
         "",
     ]
 
-    # 1. Overall
     overall_scores = {b: np.array(all_scores[b], dtype=float) for b in bfs}
-    write_stats_table(report_lines,
-                      "OVERALL",
-                      bfs, overall_scores, all_input_arr)
+    write_stats_table(report_lines, "OVERALL", bfs, overall_scores, all_input_arr)
 
-    # 2. Per split
     for split in args.splits:
         if split not in split_scores:
             continue
-        sc = {b: np.array(split_scores[split][b], dtype=float) for b in bfs}
-        iv = np.array(split_input[split], dtype=float)
-        write_stats_table(report_lines, f"SPLIT: {split}", bfs, sc, iv)
+        write_stats_table(report_lines, f"SPLIT: {split}", bfs,
+                          {b: np.array(split_scores[split][b], dtype=float) for b in bfs},
+                          np.array(split_input[split], dtype=float))
 
-    # 3. Per noise condition
     for cond in sorted(cond_scores.keys()):
-        sc = {b: np.array(cond_scores[cond][b], dtype=float) for b in bfs}
-        iv = np.array(cond_input[cond], dtype=float)
-        write_stats_table(report_lines, f"NOISE CONDITION: {cond}", bfs, sc, iv)
+        write_stats_table(report_lines, f"NOISE CONDITION: {cond}", bfs,
+                          {b: np.array(cond_scores[cond][b], dtype=float) for b in bfs},
+                          np.array(cond_input[cond], dtype=float))
 
-    # ------------------------------------------------------------------ #
-    # Print + save report
-    # ------------------------------------------------------------------ #
     report_txt = "\n".join(report_lines)
-    print("\n" + report_txt)
+    logger.info("\n" + report_txt)
 
     report_path = res_dir / "summary.txt"
     report_path.write_text(report_txt)
-    print(f"\nSummary report → {report_path}")
+    logger.info(f"\nOutput directory : {res_dir}")
+    logger.info(f"  per_utt.csv  → {csv_path}")
+    logger.info(f"  summary.txt  → {report_path}")
+    logger.info(f"  eval.log     → {res_dir / 'eval.log'}")
 
 
 if __name__ == "__main__":

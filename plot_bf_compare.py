@@ -5,9 +5,9 @@ Plot overall SI-SDR comparison between SuperRes encoder and standard STFT baseli
 Usage
 -----
     python plot_comparison.py \
-        --superres bf_eval/eval_20260513_001549/per_utt.csv \
-        --stft     bf_eval/eval_stft_20260513_102505/per_utt.csv \
-        --output   bf_eval/comparison.png
+        --superres exp/bf_eval/eval_20260513_001549/per_utt.csv \
+        --stft     exp/bf_eval/eval_stft_20260513_102505/per_utt.csv \
+        --output   exp/bf_eval/comparison.png
 """
 
 import argparse
@@ -60,9 +60,9 @@ def mean_ci95(vals: np.ndarray):
 def parse_args():
     _here = Path(__file__).resolve().parent
     p = argparse.ArgumentParser()
-    p.add_argument("--superres", default=str(_here / "bf_eval/eval_20260513_001549/per_utt.csv"))
-    p.add_argument("--stft",     default=str(_here / "bf_eval/eval_stft_20260513_102505/per_utt.csv"))
-    p.add_argument("--output",   default=str(_here / "bf_eval/comparison.png"))
+    p.add_argument("--superres", default=str(_here / "exp/bf_eval/eval_20260513_001549/per_utt.csv"))
+    p.add_argument("--stft",     default=str(_here / "exp/bf_eval/eval_stft_20260513_102505/per_utt.csv"))
+    p.add_argument("--output",   default=str(_here / "exp/bf_eval/comparison.png"))
     return p.parse_args()
 
 
