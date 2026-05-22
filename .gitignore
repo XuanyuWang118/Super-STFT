@@ -2,5 +2,10 @@
 *.pyc
 *.pyo
 *.pyd
+*.md
 exp/
 slurm_logs/
+report/
+diagnose/
+submit.sh
+

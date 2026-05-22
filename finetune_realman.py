@@ -9,18 +9,24 @@ Root-cause (confirmed by Test A-E diagnostics, 2026-05-19):
   vs 14.54 dB STFT baseline (-5.98 dB). The encoder corrupts per-bin
   inter-channel spatial information. IRM quality loss is negligible (-0.78 dB).
 
-Training procedure per sample (v5):
-  1. Random 2-N channels of clean speech (ma_speech, same room)
-  2. Same channel indices from a noise recording (ma_noise, same room)
-  3. Scale noise to random SNR, add to speech -> noisy mix
-  4. Encode S=enc(speech), N=enc(noise), X=enc(mix)
-  5. HybridSupervisionLoss on (S, speech), (N, noise), (X, mix)  [3x per-ch alignment]
-  6. CrossCovLoss: normalized cross-spectrum enc(S)_i*enc(S)_j* vs stft(S)_i*stft(S)_j*
-  7. Backprop enc + dec
+Why v4 failed:
+  HybridLoss is per-channel — cross-channel gradient is structurally zero.
 
-v5 vs v4:
-  - Step 6 (CrossCovLoss) is NEW: directly penalizes inter-channel phase errors.
-  - bf_weight=0 (bf L1 loss remains off).
+Why old-v5 (CrossCovLoss) failed:
+  Correct direction but caused 34.7% weight rotation → broke enc-dec.
+
+v5 design (this version):
+  L_total = L_hybrid + phase_w * CrossChannelPhaseLoss + anchor_w * AnchorLoss
+
+Training procedure per sample:
+  1. Random N channels of clean speech (same room)
+  2. Same channel indices from noise recording (same room)
+  3. Scale noise to random SNR, add to speech -> noisy mix
+  4. S=enc(speech), N=enc(noise), X=enc(mix)
+  5. L_hybrid = speech_w*HybridLoss(S) + noise_w*HybridLoss(N) + mix_w*HybridLoss(X)
+  6. L_phase  = CrossChannelPhaseLoss(speech, S)   [1-cos(Δphase), energy-masked]
+  7. L_anchor = ||enc.weight - enc_pretrain||_F² / ||enc_pretrain||_F²
+  8. Backprop enc + dec (both updated)
 
 Usage:
   python finetune_realman.py --config config.yaml
@@ -48,6 +54,7 @@ import numpy as np
 import soundfile as sf
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -257,6 +264,94 @@ def encode_mc(wav_mc: torch.Tensor, enc: SuperResEncoder) -> torch.Tensor:
     return enc(wav_mc.unsqueeze(1))
 
 
+def stft_mc(wav_mc: torch.Tensor, n_fft: int, hop: int) -> torch.Tensor:
+    """(C, T) -> (C, F, T_f) complex  — reference STFT, computed with no_grad."""
+    win = torch.hann_window(n_fft, device=wav_mc.device)
+    return torch.stack([
+        torch.stft(wav_mc[c], n_fft=n_fft, hop_length=hop, win_length=n_fft,
+                   window=win, return_complex=True, center=False, pad_mode="reflect")
+        for c in range(wav_mc.shape[0])
+    ])
+
+
+# -----------------------------------------------------------------------
+# CrossChannelPhaseLoss
+# -----------------------------------------------------------------------
+
+class CrossChannelPhaseLoss(nn.Module):
+    """Inter-channel phase coherence loss (v5).
+
+    For each channel pair (i, j):
+      enc_cross  = enc_i * conj(enc_j)           (encoder cross-spectrum)
+      stft_cross = stft_i * conj(stft_j)         (STFT reference, no grad)
+      loss_pair  = mean( (1 - cos(∠enc_cross - ∠stft_cross)) * energy_mask )
+
+    Energy masking: TF bins with geometric-mean amplitude below
+    threshold * mean_energy are excluded to suppress silence-region noise.
+
+    Directly targets the 5.98 dB BF gap (Test E, diagnose_spatial_cov.py).
+    Protected from catastrophic rotation by AnchorLoss.
+    """
+
+    def __init__(self, n_fft: int, hop: int,
+                 eps: float = 1e-8, energy_threshold: float = 0.1):
+        super().__init__()
+        self.n_fft = n_fft
+        self.hop = hop
+        self.eps = eps
+        self.energy_threshold = energy_threshold
+
+    def forward(self, wav_mc: torch.Tensor, enc_mc_ri: torch.Tensor) -> torch.Tensor:
+        """
+        wav_mc:    (C, T)           waveform for STFT reference
+        enc_mc_ri: (C, F, T_f, 2)  encoder output real/imag
+        Returns scalar in [0, 1].
+        """
+        C = wav_mc.shape[0]
+        if C < 2:
+            return enc_mc_ri.new_zeros(()).float()
+
+        enc_c = torch.view_as_complex(enc_mc_ri.contiguous())  # (C, F, T_f)
+
+        with torch.no_grad():
+            ref_c = stft_mc(wav_mc, self.n_fft, self.hop)       # (C, F, T_ref)
+
+        T = min(enc_c.shape[2], ref_c.shape[2])
+        enc_c = enc_c[:, :, :T]
+        ref_c = ref_c[:, :, :T]
+
+        total = enc_mc_ri.new_zeros(()).float()
+        n_pairs = 0
+        for i in range(C):
+            for j in range(i + 1, C):
+                enc_cross = enc_c[i] * enc_c[j].conj()
+                ref_cross = ref_c[i] * ref_c[j].conj()
+
+                energy = (enc_c[i].abs() * enc_c[j].abs()).sqrt()
+                mask = (energy > energy.mean() * self.energy_threshold).float()
+
+                enc_n = enc_cross / (enc_cross.abs() + self.eps)
+                ref_n = ref_cross / (ref_cross.abs() + self.eps)
+
+                cos_sim   = (enc_n * ref_n.conj()).real
+                pair_loss = ((1.0 - cos_sim) * mask).sum() / (mask.sum() + self.eps)
+                total = total + pair_loss
+                n_pairs += 1
+
+        return total / max(n_pairs, 1)
+
+
+# -----------------------------------------------------------------------
+# Anchor regularization
+# -----------------------------------------------------------------------
+
+def compute_anchor_loss(enc: SuperResEncoder, weight_ref: torch.Tensor) -> torch.Tensor:
+    """Normalized Frobenius distance from pretrained encoder weights.
+
+    Prevents catastrophic weight rotation (old-v5/CrossCovLoss: 34.7% → 2.19 dB).
+    """
+    w = enc.enc.weight
+    return (w - weight_ref).pow(2).sum() / (weight_ref.pow(2).sum() + 1e-8)
 
 
 def irm_beamform(
@@ -291,27 +386,37 @@ def irm_beamform(
 # One training step
 # -----------------------------------------------------------------------
 
-def process_sample(enc, dec, hybrid_loss, sample, device,
+def process_sample(enc, dec, hybrid_loss, phase_loss_fn, sample, device,
                    bf_weight: float,
-                   speech_weight: float, noise_weight: float, mix_weight: float):
-    """Returns (loss, stft_loss, bf_loss, loss_S, loss_N, loss_X,
-                details_S, details_N, details_X)."""
+                   speech_weight: float, noise_weight: float, mix_weight: float,
+                   phase_weight: float,
+                   anchor_weight: float, enc_weight_ref: torch.Tensor):
+    """Returns (total, stft_loss, phase_loss, anchor_loss, bf_loss,
+                loss_S, loss_N, loss_X, details_S, details_N, details_X)."""
     speech_mc, noise_mc, mix_mc = [x.to(device) for x in sample]
     C, T = speech_mc.shape
 
-    # Encode: (C, F, T_f, 2)
     S_ri = encode_mc(speech_mc, enc)
     N_ri = encode_mc(noise_mc,  enc)
     X_ri = encode_mc(mix_mc,    enc)
 
-    # HybridSupervisionLoss on each signal independently.
     loss_S, details_S = hybrid_loss(S_ri, speech_mc.unsqueeze(1))
     loss_N, details_N = hybrid_loss(N_ri, noise_mc.unsqueeze(1))
     loss_X, details_X = hybrid_loss(X_ri, mix_mc.unsqueeze(1))
     stft_loss = speech_weight * loss_S + noise_weight * loss_N + mix_weight * loss_X
 
+    # Cross-channel phase coherence (v5)
+    phase_loss = enc_weight_ref.new_zeros(()).float()
+    if phase_weight > 0.0 and C >= 2:
+        phase_loss = phase_loss_fn(speech_mc, S_ri)
+
+    # Anchor regularization: prevent encoder weight rotation (v5)
+    anchor_loss = enc_weight_ref.new_zeros(()).float()
+    if anchor_weight > 0.0:
+        anchor_loss = compute_anchor_loss(enc, enc_weight_ref)
+
     # Beamforming loss (off by default via bf_weight=0)
-    bf_loss = torch.tensor(0.0, device=device)
+    bf_loss = enc_weight_ref.new_zeros(()).float()
     if bf_weight > 0.0:
         try:
             S_c = torch.view_as_complex(S_ri.contiguous())
@@ -327,22 +432,24 @@ def process_sample(enc, dec, hybrid_loss, sample, device,
         except Exception:
             logger.warning(f"    bf step failed: {traceback.format_exc()}")
 
-    loss = stft_loss + bf_weight * bf_loss
-    return loss, stft_loss, bf_loss, loss_S, loss_N, loss_X, details_S, details_N, details_X
+    total = stft_loss + phase_weight * phase_loss + anchor_weight * anchor_loss + bf_weight * bf_loss
+    return total, stft_loss, phase_loss, anchor_loss, bf_loss, loss_S, loss_N, loss_X, details_S, details_N, details_X
 
 
 # -----------------------------------------------------------------------
 # Epoch loop
 # -----------------------------------------------------------------------
 
-def run_epoch(enc, dec, hybrid_loss, optimizer, samples, device,
+def run_epoch(enc, dec, hybrid_loss, phase_loss_fn, optimizer, samples, device,
               is_train, grad_clip, bf_weight,
               speech_weight, noise_weight, mix_weight,
+              phase_weight, anchor_weight, enc_weight_ref,
               log_interval=200, total_samples=None, max_steps=None):
-    enc.train(is_train); dec.train(is_train)
+    enc.train(is_train)
+    dec.train(is_train)
 
     totals = dict(
-        total=0.0, stft=0.0, bf=0.0,
+        total=0.0, stft=0.0, phase=0.0, anchor=0.0, bf=0.0,
         S_total=0.0, S_mag=0.0, S_real=0.0, S_imag=0.0,
         N_total=0.0, N_mag=0.0, N_real=0.0, N_imag=0.0,
         X_total=0.0, X_mag=0.0, X_real=0.0, X_imag=0.0,
@@ -358,27 +465,36 @@ def run_epoch(enc, dec, hybrid_loss, optimizer, samples, device,
             if i == 0:
                 logger.info("  first batch received")
             t_step = time.time()
-            loss, sl, bl, loss_S, loss_N, loss_X, ds, dn, dx = process_sample(
-                enc, dec, hybrid_loss, sample, device,
+            (total_loss, sl, pl, al, bl,
+             loss_S, loss_N, loss_X, ds, dn, dx) = process_sample(
+                enc, dec, hybrid_loss, phase_loss_fn, sample, device,
                 bf_weight=bf_weight,
                 speech_weight=speech_weight,
                 noise_weight=noise_weight,
                 mix_weight=mix_weight,
+                phase_weight=phase_weight,
+                anchor_weight=anchor_weight,
+                enc_weight_ref=enc_weight_ref,
             )
             if i == 0:
                 logger.info(f"  first sample done in {time.time()-t_step:.2f}s")
             if is_train:
                 optimizer.zero_grad()
-                loss.backward()
+                total_loss.backward()
                 clip_grad_norm_(list(enc.parameters()) + list(dec.parameters()), grad_clip)
                 optimizer.step()
 
-            totals["total"] += loss.item()
-            totals["stft"]  += sl.item()
-            totals["bf"]    += bl.item() if isinstance(bl, torch.Tensor) else float(bl)
-            totals["S_total"] += loss_S.item()
-            totals["N_total"] += loss_N.item()
-            totals["X_total"] += loss_X.item()
+            def _v(x):
+                return x.item() if isinstance(x, torch.Tensor) else float(x)
+
+            totals["total"]   += _v(total_loss)
+            totals["stft"]    += _v(sl)
+            totals["phase"]   += _v(pl)
+            totals["anchor"]  += _v(al)
+            totals["bf"]      += _v(bl)
+            totals["S_total"] += _v(loss_S)
+            totals["N_total"] += _v(loss_N)
+            totals["X_total"] += _v(loss_X)
             for prefix, det in (("S", ds), ("N", dn), ("X", dx)):
                 totals[f"{prefix}_mag"]  += det.get("loss_mag",  0.0)
                 totals[f"{prefix}_real"] += det.get("loss_real", 0.0)
@@ -398,9 +514,9 @@ def run_epoch(enc, dec, hybrid_loss, optimizer, samples, device,
                 logger.info(
                     f"  {progress} "
                     f"total={totals['total']/n:.4f}  stft={totals['stft']/n:.4f}  "
-                    f"S(tot={totals['S_total']/n:.4f} mag={totals['S_mag']/n:.4f} "
-                    f"re={totals['S_real']/n:.4f} im={totals['S_imag']/n:.4f})  "
-                    f"avg={avg:.2f}s/sample{eta_str}"
+                    f"phase={totals['phase']/n:.4f}  anchor={totals['anchor']/n:.4f}  "
+                    f"S(mag={totals['S_mag']/n:.4f} re={totals['S_real']/n:.4f} "
+                    f"im={totals['S_imag']/n:.4f})  avg={avg:.2f}s/sample{eta_str}"
                 )
 
             if max_steps and n >= max_steps:
@@ -417,44 +533,46 @@ def run_epoch(enc, dec, hybrid_loss, optimizer, samples, device,
 def plot_loss_curves(history: dict, save_path: Path, best_epoch: int = None):
     epochs = list(range(1, len(history["train"]) + 1))
 
-    # Component style: color per metric, solid=train / dashed=val
+    fig, axes = plt.subplots(2, 3, figsize=(18, 9))
+    fig.suptitle("v5 Fine-tune Loss Curves (enc+dec)", fontsize=13, fontweight="bold")
+
+    def _plot_pair(ax, key, title, color):
+        tr = [h.get(key, 0.0) for h in history["train"]]
+        vl = [h.get(key, 0.0) for h in history["val"]]
+        ax.plot(epochs, tr, color=color, linewidth=1.8, label="Train")
+        ax.plot(epochs, vl, color=color, linewidth=1.8, linestyle="--", alpha=0.7, label="Val")
+        if best_epoch:
+            ax.axvline(best_epoch, color="gray", linestyle=":", linewidth=1.0)
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel("Epoch", fontsize=8)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+
+    # Row 0: top-level loss terms
+    _plot_pair(axes[0, 0], "total",  "Total Loss",           "tab:red")
+    _plot_pair(axes[0, 1], "phase",  "Phase Coherence Loss", "tab:purple")
+    _plot_pair(axes[0, 2], "anchor", "Anchor Loss",          "tab:brown")
+
+    # Row 1: per-signal HybridLoss breakdown (total / mag / real / imag)
     comp_styles = [
-        ("total", "Total",   "black",       2.0),
-        ("mag",   "Mag",     "tab:blue",    1.0),
-        ("real",  "Real",    "tab:orange",  1.0),
-        ("imag",  "Imag",    "tab:green",   1.0),
+        ("total", "Total", "black",      2.0),
+        ("mag",   "Mag",   "tab:blue",   1.2),
+        ("real",  "Real",  "tab:orange", 1.2),
+        ("imag",  "Imag",  "tab:green",  1.2),
     ]
-
-    fig, axes = plt.subplots(1, 4, figsize=(24, 4.5))
-    fig.suptitle("HybridLoss Training Curves — S / N / X Component Breakdown", fontsize=12)
-
-    # --- subplot 0: overall total loss ---
-    ax = axes[0]
-    tr = [h.get("total", 0.0) for h in history["train"]]
-    vl = [h.get("total", 0.0) for h in history["val"]]
-    ax.plot(epochs, tr, color="tab:red",  linewidth=1.8, label="Train")
-    ax.plot(epochs, vl, color="tab:blue", linewidth=1.8, linestyle="--", label="Val")
-    if best_epoch:
-        ax.axvline(best_epoch, color="gray", linestyle=":", linewidth=1.0)
-    ax.set_title("Overall Total Loss")
-    ax.set_xlabel("Epoch")
-    ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=8)
-
-    # --- subplots 1-3: per-signal component breakdown ---
-    for ax, (prefix, signal_name) in zip(axes[1:], [("S", "Speech"), ("N", "Noise"), ("X", "Mix")]):
+    for ax, (prefix, sig) in zip(axes[1, :], [("S", "Speech"), ("N", "Noise"), ("X", "Mix")]):
         for comp, label, color, lw in comp_styles:
             key = f"{prefix}_total" if comp == "total" else f"{prefix}_{comp}"
-            tr_vals = [h.get(key, 0.0) for h in history["train"]]
-            vl_vals = [h.get(key, 0.0) for h in history["val"]]
-            ax.plot(epochs, tr_vals, color=color, linewidth=lw,
+            tr_v = [h.get(key, 0.0) for h in history["train"]]
+            vl_v = [h.get(key, 0.0) for h in history["val"]]
+            ax.plot(epochs, tr_v, color=color, linewidth=lw,
                     label=f"{label}·tr", alpha=0.9)
-            ax.plot(epochs, vl_vals, color=color, linewidth=max(lw - 0.3, 0.7),
+            ax.plot(epochs, vl_v, color=color, linewidth=max(lw - 0.3, 0.7),
                     linestyle="--", label=f"{label}·vl", alpha=0.65)
         if best_epoch:
             ax.axvline(best_epoch, color="gray", linestyle=":", linewidth=1.0)
-        ax.set_title(f"Hybrid Loss — {signal_name} ({prefix})")
-        ax.set_xlabel("Epoch")
+        ax.set_title(f"HybridLoss — {sig} ({prefix})", fontsize=10)
+        ax.set_xlabel("Epoch", fontsize=8)
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=6, ncol=2, loc="upper right",
                   handlelength=1.5, columnspacing=0.8, labelspacing=0.3)
@@ -566,6 +684,8 @@ def load_ft_config(yaml_path: str) -> dict:
         sr=16000, seg_len=2.0, min_ch=2, max_ch=8,
         snr_min=-5.0, snr_max=20.0, bf_weight=0.0,
         speech_weight=1.0, noise_weight=1.0, mix_weight=1.0,
+        phase_weight=0.05,    # CrossChannelPhaseLoss
+        anchor_weight=10.0,   # AnchorLoss (prevents weight rotation)
         max_steps_per_epoch=None,
         val_rooms=["Cafeteria2", "Park", "Car-Electric"],
     )
@@ -620,6 +740,19 @@ def main():
     enc.load_state_dict(ckpt["encoder"])
     dec.load_state_dict(ckpt["decoder"])
     logger.info(f"Loaded checkpoint: {ft['pretrain_ckpt']}  (epoch {ckpt.get('epoch', '?')})")
+
+    # Frozen pretrained reference for anchor regularization
+    enc_weight_ref = enc.enc.weight.data.clone().detach().to(device)
+    logger.info(f"Anchor ref: enc.enc.weight  shape={enc_weight_ref.shape}  "
+                f"||W||_F={enc_weight_ref.norm().item():.2f}")
+
+    phase_loss_fn = CrossChannelPhaseLoss(
+        n_fft=cfg.base_win_len, hop=cfg.base_hop_len,
+    ).to(device)
+    logger.info(f"CrossChannelPhaseLoss: n_fft={cfg.base_win_len}  hop={cfg.base_hop_len}")
+    logger.info(f"Loss weights: hybrid(S={ft['speech_weight']} N={ft['noise_weight']} "
+                f"X={ft['mix_weight']})  phase={ft['phase_weight']}  "
+                f"anchor={ft['anchor_weight']}  bf={ft['bf_weight']}")
 
     hybrid_loss = HybridSupervisionLoss(cfg).to(device)
     for param in hybrid_loss.parameters():
@@ -725,46 +858,49 @@ def main():
         t0 = time.time()
         logger.info(f"\n=== Epoch {epoch}/{ft['epochs']}  (lr={optimizer.param_groups[0]['lr']:.2e}) ===")
 
+        _shared = dict(
+            device=device, grad_clip=ft["grad_clip"],
+            bf_weight=ft["bf_weight"],
+            speech_weight=ft["speech_weight"],
+            noise_weight=ft["noise_weight"],
+            mix_weight=ft["mix_weight"],
+            phase_weight=ft["phase_weight"],
+            anchor_weight=ft["anchor_weight"],
+            enc_weight_ref=enc_weight_ref,
+            max_steps=ft.get("max_steps_per_epoch"),
+        )
+
         logger.info("  [Train]")
         try:
-            tr = run_epoch(enc, dec, hybrid_loss, optimizer,
-                           iter_samples(train_loader), device,
-                           is_train=True, grad_clip=ft["grad_clip"],
-                           bf_weight=ft["bf_weight"],
-                           speech_weight=ft["speech_weight"],
-                           noise_weight=ft["noise_weight"],
-                           mix_weight=ft["mix_weight"],
-                           log_interval=ft["log_interval"],
-                           total_samples=len(train_ds),
-                           max_steps=ft.get("max_steps_per_epoch"))
+            tr = run_epoch(enc, dec, hybrid_loss, phase_loss_fn, optimizer,
+                           iter_samples(train_loader),
+                           is_train=True, log_interval=ft["log_interval"],
+                           total_samples=len(train_ds), **_shared)
         except Exception:
             logger.error(f"[ERROR] Train epoch {epoch} failed:\n{traceback.format_exc()}")
             break
 
         logger.info("  [Val]")
         try:
-            vl = run_epoch(enc, dec, hybrid_loss, None,
-                           iter_samples(val_loader), device,
-                           is_train=False, grad_clip=ft["grad_clip"],
-                           bf_weight=ft["bf_weight"],
-                           speech_weight=ft["speech_weight"],
-                           noise_weight=ft["noise_weight"],
-                           mix_weight=ft["mix_weight"],
-                           log_interval=0,
-                           total_samples=len(val_ds),
-                           max_steps=ft.get("max_steps_per_epoch"))
+            vl = run_epoch(enc, dec, hybrid_loss, phase_loss_fn, None,
+                           iter_samples(val_loader),
+                           is_train=False, log_interval=0,
+                           total_samples=len(val_ds), **_shared)
         except Exception:
             logger.error(f"[ERROR] Val epoch {epoch} failed:\n{traceback.format_exc()}")
             break
 
+        with torch.no_grad():
+            drift_pct = ((enc.enc.weight.data - enc_weight_ref).norm() /
+                         enc_weight_ref.norm() * 100).item()
+
         elapsed = time.time() - t0
         logger.info(
             f"  Epoch {epoch} | "
-            f"train total={tr['total']:.4f}  "
-            f"S(tot={tr['S_total']:.4f} mag={tr['S_mag']:.4f} re={tr['S_real']:.4f} im={tr['S_imag']:.4f}) | "
-            f"val total={vl['total']:.4f}  "
-            f"S(tot={vl['S_total']:.4f} mag={vl['S_mag']:.4f} re={vl['S_real']:.4f} im={vl['S_imag']:.4f}) | "
-            f"{elapsed:.0f}s"
+            f"train: total={tr['total']:.4f}  stft={tr['stft']:.4f}  "
+            f"phase={tr['phase']:.4f}  anchor={tr['anchor']:.4f} | "
+            f"val:   total={vl['total']:.4f}  phase={vl['phase']:.4f} | "
+            f"enc_drift={drift_pct:.2f}%  {elapsed:.0f}s"
         )
 
         scheduler.step(vl["total"])
@@ -817,17 +953,17 @@ def main():
             if write_header:
                 fcsv.write(
                     "epoch,"
-                    "tr_total,tr_stft,tr_bf,"
+                    "tr_total,tr_stft,tr_phase,tr_anchor,tr_bf,"
                     "tr_S_total,tr_S_mag,tr_S_real,tr_S_imag,"
                     "tr_N_total,tr_N_mag,tr_N_real,tr_N_imag,"
                     "tr_X_total,tr_X_mag,tr_X_real,tr_X_imag,"
-                    "vl_total,vl_stft,vl_bf,"
+                    "vl_total,vl_stft,vl_phase,vl_anchor,vl_bf,"
                     "vl_S_total,vl_S_mag,vl_S_real,vl_S_imag,"
                     "vl_N_total,vl_N_mag,vl_N_real,vl_N_imag,"
                     "vl_X_total,vl_X_mag,vl_X_real,vl_X_imag\n"
                 )
             def _row(d):
-                keys = ["total", "stft", "bf",
+                keys = ["total", "stft", "phase", "anchor", "bf",
                         "S_total", "S_mag", "S_real", "S_imag",
                         "N_total", "N_mag", "N_real", "N_imag",
                         "X_total", "X_mag", "X_real", "X_imag"]
