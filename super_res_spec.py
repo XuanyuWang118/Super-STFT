@@ -691,6 +691,180 @@ class HybridSupervisionLoss(MultiResConsistencyLoss):
         return total_loss, details
 
 
+class MultiResPhaseConsistencyLoss(nn.Module):
+    """Per-channel, per-resolution anti-wrapping phase loss (v7).
+
+    For each resolution (win_ms, hop_ms):
+      1. Project encoder output (F_base, T_enc) → (F_r, T_r)
+         via triangular filterbank (freq) + block mean (time, no phase rotation)
+      2. Compute GT STFT at that resolution (no grad)
+      3. Energy-mask by GT power
+      4. Compute per-channel:
+           IPL  = mean(f_AW(∠proj - ∠gt))
+           IAFL = mean(f_AW(∠(proj[:,t+1]·proj[:,t]*) - ∠(gt[:,t+1]·gt[:,t]*)))
+           GDL  = mean(f_AW(∠(proj[k+1,:]·proj[k,:]*)  - ∠(gt[k+1,:]·gt[k,:]*)))
+
+    Anti-wrapping: f_AW(x) = |x - 2π·round(x/(2π))|
+
+    Unlike CrossChannelPhaseLoss (v5), this is fully per-channel and projects
+    encoder features to each target resolution before comparison.
+    """
+
+    def __init__(self, config: STFTConfig,
+                 ipl_weight: float = 1.0,
+                 iafl_weight: float = 1.0,
+                 gdl_weight: float = 0.5,
+                 resolution_weights=None,
+                 eps: float = 1e-8):
+        super().__init__()
+        self.config      = config
+        self.ipl_weight  = ipl_weight
+        self.iafl_weight = iafl_weight
+        self.gdl_weight  = gdl_weight
+        self.eps         = eps
+
+        n_res = len(config.target_resolutions)
+        if resolution_weights is None:
+            self.resolution_weights = [1.0 / n_res] * n_res
+        else:
+            total = sum(resolution_weights) + 1e-8
+            self.resolution_weights = [w / total for w in resolution_weights]
+
+        for win_ms, hop_ms in config.target_resolutions:
+            target_win_len = int(config.sr * win_ms / 1000)
+            if config.base_win_len > target_win_len:
+                n_freq_in  = config.base_win_len  // 2 + 1
+                n_freq_out = target_win_len // 2 + 1
+                mat = create_triangular_filterbank(n_freq_in, n_freq_out, config.sr)
+                self.register_buffer(f"freq_mat_{win_ms}_{hop_ms}", mat)
+
+    @staticmethod
+    def f_aw(x: torch.Tensor) -> torch.Tensor:
+        """Anti-wrapping function: |x - 2π·round(x/(2π))|"""
+        return torch.abs(x - 2.0 * math.pi * torch.round(x / (2.0 * math.pi)))
+
+    def _project(self, enc_c: torch.Tensor, win_ms: int, hop_ms: int) -> torch.Tensor:
+        """Project encoder complex (F_base, T_enc) → (F_r, T_r).
+
+        Frequency: triangular filterbank (same matrices as MultiResConsistencyLoss).
+        Time: block mean — no phase-rotation correction, preserves instantaneous phase.
+        """
+        target_win_len = int(self.config.sr * win_ms / 1000)
+        if self.config.base_win_len > target_win_len:
+            W    = getattr(self, f"freq_mat_{win_ms}_{hop_ms}")  # (F_r, F_base)
+            proj = torch.complex(W @ enc_c.real, W @ enc_c.imag)
+        else:
+            proj = enc_c
+
+        target_hop_len = int(self.config.sr * hop_ms / 1000)
+        time_factor    = max(1, target_hop_len // self.config.base_hop_len)
+        if time_factor > 1:
+            F_r, T_enc = proj.shape
+            remainder  = T_enc % time_factor
+            if remainder != 0:
+                proj = F.pad(proj, (0, time_factor - remainder))
+            proj = proj.view(F_r, proj.shape[-1] // time_factor, time_factor).mean(dim=-1)
+
+        return proj  # (F_r, T_r) complex
+
+    def _safe_angle(self, z: torch.Tensor) -> torch.Tensor:
+        """Numerically stable angle: normalize to unit circle before atan2.
+
+        torch.angle(z) uses atan2(imag, real); the gradient is undefined at z=0.
+        Normalizing first ensures well-defined gradients everywhere, while the
+        energy mask suppresses the low-amplitude bins' contribution to the loss.
+        """
+        return torch.angle(z / (z.abs() + self.eps))
+
+    def _phase_losses(self, proj: torch.Tensor, gt_c: torch.Tensor):
+        """Compute IPL, IAFL, GDL as plain means over all TF bins (no mask)."""
+        ipl  = self.f_aw(self._safe_angle(proj) - self._safe_angle(gt_c)).mean()
+
+        pred_tf = proj[:, 1:] * proj[:, :-1].conj()
+        gt_tf   = gt_c[:, 1:] * gt_c[:, :-1].conj()
+        iafl    = self.f_aw(self._safe_angle(pred_tf) - self._safe_angle(gt_tf)).mean()
+
+        pred_ff = proj[1:, :] * proj[:-1, :].conj()
+        gt_ff   = gt_c[1:, :] * gt_c[:-1, :].conj()
+        gdl     = self.f_aw(self._safe_angle(pred_ff) - self._safe_angle(gt_ff)).mean()
+
+        return ipl, iafl, gdl
+
+    def forward(self, enc_mc_ri: torch.Tensor, speech_mc: torch.Tensor):
+        """
+        Args:
+            enc_mc_ri: (C, F_base, T_enc, 2)  encoder output [real, imag]
+            speech_mc: (C, T)                  waveforms for GT STFT reference
+
+        Returns:
+            total_loss: differentiable scalar tensor
+            details:    {
+                'ipl': float, 'iafl': float, 'gdl': float,
+                'per_res': {'64ms_32ms': {'ipl','iafl','gdl','total'}, ...}
+            }
+        """
+        C        = enc_mc_ri.shape[0]
+        device   = enc_mc_ri.device
+        enc_mc_c = torch.view_as_complex(enc_mc_ri.contiguous())  # (C, F_base, T_enc)
+
+        total_loss  = enc_mc_ri.new_zeros(())
+        sum_ipl     = 0.0
+        sum_iafl    = 0.0
+        sum_gdl     = 0.0
+        per_res: dict = {}
+
+        for res_idx, (win_ms, hop_ms) in enumerate(self.config.target_resolutions):
+            target_win_len = int(self.config.sr * win_ms  / 1000)
+            target_hop_len = int(self.config.sr * hop_ms  / 1000)
+            res_w          = self.resolution_weights[res_idx]
+
+            with torch.no_grad():
+                win_fn  = torch.hann_window(target_win_len, device=device)
+                gt_mc   = torch.stack([
+                    torch.stft(speech_mc[c], n_fft=target_win_len,
+                               hop_length=target_hop_len, win_length=target_win_len,
+                               window=win_fn, center=True, return_complex=True)
+                    for c in range(C)
+                ])  # (C, F_r, T_gt)
+
+            res_ipl_t  = enc_mc_ri.new_zeros(())
+            res_iafl_t = enc_mc_ri.new_zeros(())
+            res_gdl_t  = enc_mc_ri.new_zeros(())
+
+            for c in range(C):
+                proj_c = self._project(enc_mc_c[c], win_ms, hop_ms)
+                gt_c   = gt_mc[c]
+                T      = min(proj_c.shape[1], gt_c.shape[1])
+                proj_c, gt_c = proj_c[:, :T], gt_c[:, :T]
+
+                ipl_c, iafl_c, gdl_c = self._phase_losses(proj_c, gt_c)
+                res_ipl_t  = res_ipl_t  + ipl_c
+                res_iafl_t = res_iafl_t + iafl_c
+                res_gdl_t  = res_gdl_t  + gdl_c
+
+            res_ipl_t, res_iafl_t, res_gdl_t = (
+                res_ipl_t / C, res_iafl_t / C, res_gdl_t / C
+            )
+            total_loss = total_loss + (
+                self.ipl_weight  * res_ipl_t  +
+                self.iafl_weight * res_iafl_t +
+                self.gdl_weight  * res_gdl_t
+            ) * res_w
+
+            ri, rai, rg = res_ipl_t.item(), res_iafl_t.item(), res_gdl_t.item()
+            per_res[f"{win_ms}ms_{hop_ms}ms"] = {
+                "ipl": ri, "iafl": rai, "gdl": rg,
+                "total": (ri * self.ipl_weight + rai * self.iafl_weight + rg * self.gdl_weight) * res_w,
+            }
+            sum_ipl += ri; sum_iafl += rai; sum_gdl += rg
+
+        n_res = len(self.config.target_resolutions)
+        return total_loss, {
+            "ipl": sum_ipl / n_res, "iafl": sum_iafl / n_res, "gdl": sum_gdl / n_res,
+            "per_res": per_res,
+        }
+
+
 class GOMPSNRLoss(nn.Module):
     def __init__(self, config: STFTConfig):
         super().__init__()
