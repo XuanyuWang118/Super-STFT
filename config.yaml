@@ -11,7 +11,7 @@ dataset:
 
 # ================= Training Settings =================
 train:
-  exp_dir: "exp/v6-4"
+  exp_dir: "exp/v8-2"
   batch_size: 4
   num_workers: 4
   epochs: 150
@@ -41,7 +41,12 @@ model:
 
 # ================= Loss Weights =================
 loss:
-  mask_type: "none" 
+  mask_type: "none"
+  phase_weight:
+    weight: 30.0
+    w_ip: 0.2
+    w_gd: 1.0
+    w_if: 1.0
   multi_res_weight: 
     weight: 300.0
     resolution_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
@@ -72,22 +77,25 @@ visualization:
   zoom_end: 0.80
   plot_items: ['pred', 'target']
 
-# ================= Phase Fine-tuning (RealMAN) — v5 =================
-# v5: HybridLoss × 3  +  CrossChannelPhaseLoss  +  AnchorLoss
+# ================= Phase Fine-tuning (RealMAN) — v7 =================
+# v7: HybridLoss × 3  +  MultiResPhaseConsistencyLoss  +  AnchorLoss
 # enc + dec both updated; anchor prevents weight rotation
 #
-# Experiment grid:
+# v5 history (CrossChannelPhaseLoss):
 #   v5-1: phase=0.05, anchor=10.0  (conservative, enc_drift=0.31%, BF≈baseline)
 #   v5-2: phase=0.20, anchor= 5.0  (moderate,  enc_drift≈1.5%)
 #   v5-3: phase=0.50, anchor= 2.0  (aggressive, enc_drift≈3%,  BF略降)
+#   → CrossChannelPhaseLoss abandoned: assumes STFT res == encoder res (incorrect)
+#
+# v7-1: mr_phase=5.0, ipl=1.0, iafl=1.0, gdl=0.5, anchor=5.0
 phase_finetune:
   data_root: "/gpfs/sjtu/audiocc/data/import/RealMAN"
   pretrain_ckpt: "exp/v6-4/best_valid_loss.pth"
   pretrain_config: "exp/v6-4/config.yaml"
-  exp_dir: "exp/phase_finetune/v5-2"
+  exp_dir: "exp/phase_finetune/v7-8"
 
   # Training hyperparameters
-  epochs: 30
+  epochs: 50
   learning_rate: 3.0e-05
   lr_factor: 0.5
   lr_patience: 5
@@ -106,21 +114,23 @@ phase_finetune:
   snr_max: 20.0
 
   # Step limit per epoch
-  max_steps_per_epoch: 1000
+  max_steps_per_epoch: 5000
 
-  # HybridLoss signal weights (per-channel reconstruction stability)
-  speech_weight: 1.0
-  noise_weight:  1.0
-  mix_weight:    1.0
+  # HybridLoss signal weights — all zero (phase-only ablation vs v7-6)
+  speech_weight: 0.0
+  noise_weight:  0.0
+  mix_weight:    0.0
   bf_weight:     0.0
 
-  # CrossChannelPhaseLoss: 1-cos(Δphase), energy-masked over channel pairs
-  # Directly targets 5.98 dB BF gap root cause.
-  phase_weight: 0.20
+  # MultiScalePhaseAuxLoss: multi-scale complex downsampler phase loss
+  # w_ip: instantaneous phase | w_gd: group delay | w_if: instantaneous frequency
+  mr_phase_weight: 0.5
+  w_ip: 0.2
+  w_gd: 1.0
+  w_if: 1.0
 
   # AnchorLoss: ||enc.weight - pretrain||_F² / ||pretrain||_F²
-  # Prevents catastrophic weight rotation (old-v5/CrossCovLoss: 34.7% → 2.19 dB)
-  anchor_weight: 5.0
+  anchor_weight: 20.0
 
   # HybridLoss internal weight overrides (omit to inherit pretrain config)
   # mag_weight_override:  10.0

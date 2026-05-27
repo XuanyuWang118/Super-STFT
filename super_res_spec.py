@@ -47,6 +47,18 @@ def create_triangular_filterbank(n_freq_in, n_freq_out, sr):
     return weights
 
 
+def stft_left_aligned(signal, n_fft, hop_length, win_length, window, pad_amount):
+    """左对齐 STFT：统一外部补 pad_amount 再 center=False，与 encoder 的 F.pad 约定一致。"""
+    padded = F.pad(signal, (pad_amount, pad_amount))
+    return torch.stft(padded, n_fft=n_fft, hop_length=hop_length, win_length=win_length, 
+                      window=window, center=False, return_complex=True)
+
+
+def anti_wrap(x):
+    """反缠绕：把相位差映射到 (-pi, pi]。f_aw(x) = x - 2pi*round(x/2pi)。"""
+    return x - 2 * math.pi * torch.round(x / (2 * math.pi))
+
+
 class STFTConfig:
     def __init__(self, cfg_dict: Dict[str, Any] = None, yaml_path: str = None):
         """
@@ -55,7 +67,7 @@ class STFTConfig:
         if yaml_path:
             with open(yaml_path, 'r') as f:
                 cfg_dict = yaml.safe_load(f)
-        
+
         if cfg_dict is None:
             cfg_dict = {
                 'audio': {'sample_rate': 16000},
@@ -64,26 +76,21 @@ class STFTConfig:
                 'loss': {}
             }
 
-        # 1. Audio Params
         self.sr = cfg_dict.get('audio', {}).get('sample_rate', 16000)
         self.segment_length = cfg_dict.get('audio', {}).get('segment_length', 1.0)
 
-        # 2. STFT Params
         stft_cfg = cfg_dict.get('stft', {})
         self.target_resolutions = stft_cfg.get('target_resolutions', [(64, 32)])
         self.super_hop_ms = stft_cfg.get('super_hop_ms', 1.0)
-        
-        # 3. Model Params
+
         model_cfg = cfg_dict.get('model', {})
         self.encoder_init = model_cfg.get('encoder_init', 'dft')
         self.decoder_init = model_cfg.get('decoder_init', 'idft')
 
-        # 4. Loss Params
         loss_cfg = cfg_dict.get('loss', {})
 
         self.mask_type = loss_cfg.get('mask_type', 'none')
 
-        # (1) Multi-Resolution Consistency Loss Weights
         multi_res_weight = loss_cfg.get('multi_res_weight', {})
         self.multi_res_weight = multi_res_weight.get('weight', 1.0)
 
@@ -102,7 +109,6 @@ class STFTConfig:
         else:
             self.resolution_weights = [1.0 / len(self.target_resolutions)] * len(self.target_resolutions)
 
-        # (2) GOMPSNR Loss Weights 
         gompsnr_weight = loss_cfg.get('gompsnr_weight', {})
         self.gompsnr_weight = gompsnr_weight.get('weight', 1.0)
         w_w = gompsnr_weight.get('wop_weight', 1.0)
@@ -113,29 +119,26 @@ class STFTConfig:
         self.wop_alpha = gompsnr_weight.get('wop_alpha', 100)
         self.mag_dist_type = gompsnr_weight.get('mag_dist_type', 'L1')
 
-        # (3) Reconstruction Loss Weight
         self.recon_weight = loss_cfg.get('recon_weight', 1.0)
         self.sisnr_weight = loss_cfg.get('sisnr_weight', 0.0)
 
-        # (4) 其他 Loss Weights 可以在这里添加
-        self.entropy_weight = loss_cfg.get('entropy_weight', 0.0)
-        self.tv_weight = loss_cfg.get('tv_weight', 0.0)
-
-        # 5. Derived Params (Calculated)
         self.max_win_ms = max([r[0] for r in self.target_resolutions])
         self.base_win_len = int(self.sr * self.max_win_ms / 1000)
         self.base_hop_len = int(self.sr * self.super_hop_ms / 1000)
-        
+
         if self.base_win_len % 2 != 0:
             self.base_win_len += 1
 
     def __repr__(self):
-        return (f"STFTConfig(mask_type='{self.mask_type}', sr={self.sr}, segment_length={self.segment_length}, target_resolutions={self.target_resolutions}, "
-                f"super_hop_ms={self.super_hop_ms}, encoder_init='{self.encoder_init}', decoder_init='{self.decoder_init}', "
+        return (f"STFTConfig(sr={self.sr}, segment_length={self.segment_length}, "
+                f"target_resolutions={self.target_resolutions}, super_hop_ms={self.super_hop_ms}, "
+                f"encoder_init='{self.encoder_init}', decoder_init='{self.decoder_init}', "
                 f"multi_res_weight={self.multi_res_weight}, resolution_weights={self.resolution_weights}, "
                 f"real_weight={self.real_weight}, imag_weight={self.imag_weight}, mag_weight={self.mag_weight}, "
-                f"gompsnr_weight={self.gompsnr_weight}, wop_weight={self.wop_weight}, cori_weight={self.cori_weight}, wop_alpha={self.wop_alpha}, mag_dist_type='{self.mag_dist_type}', "
-                f"recon_weight={self.recon_weight}, sisnr_weight={self.sisnr_weight}, base_win_len={self.base_win_len}, base_hop_len={self.base_hop_len})")
+                f"gompsnr_weight={self.gompsnr_weight}, wop_weight={self.wop_weight}, cori_weight={self.cori_weight}, "
+                f"wop_alpha={self.wop_alpha}, mag_dist_type='{self.mag_dist_type}', "
+                f"recon_weight={self.recon_weight}, sisnr_weight={self.sisnr_weight}, "
+                f"base_win_len={self.base_win_len}, base_hop_len={self.base_hop_len})")
 
 
 class SuperResEncoder(nn.Module):
@@ -150,7 +153,7 @@ class SuperResEncoder(nn.Module):
             kernel_size=config.base_win_len,
             stride=config.base_hop_len,
             bias=False,
-            padding=0 
+            padding=0
         )
         self._init_weights()
 
@@ -162,7 +165,6 @@ class SuperResEncoder(nn.Module):
             self.enc.weight.data = weight.unsqueeze(1)
         else:
             nn.init.kaiming_normal_(self.enc.weight)
-        
         self.enc.weight.requires_grad = True
 
     def forward(self, x):
@@ -172,10 +174,10 @@ class SuperResEncoder(nn.Module):
         """
         pad_amount = self.config.base_win_len // 2
         x_padded = F.pad(x, (pad_amount, pad_amount), mode='constant', value=0.0)
-        feat = self.enc(x_padded) 
+        feat = self.enc(x_padded)
         cutoff = self.n_fft // 2 + 1
-        real = feat[:, :cutoff, :] 
-        imag = feat[:, cutoff:, :] 
+        real = feat[:, :cutoff, :]
+        imag = feat[:, cutoff:, :]
         spec = torch.stack([real, imag], dim=-1)
         return spec
 
@@ -195,30 +197,16 @@ class SuperResDecoder(nn.Module):
             padding=0
         )
 
-    # def forward(self, spec):
-    #     """
-    #     spec: (Batch, Freq_bin, Time_frame, 2)
-    #     return: (Batch, 1, Time)
-    #     """
-    #     real = spec[..., 0]
-    #     imag = spec[..., 1]
-    #     feat = torch.cat([real, imag], dim=1)
-    #     waveform = self.dec(feat)
-    #     pad_amount = self.config.base_win_len // 2
-    #     if pad_amount > 0:
-    #         waveform = waveform[:, :, pad_amount:-pad_amount]
-    #     return waveform
-    
     def forward(self, spec, target_len=None):
         """
         spec: (Batch, Freq_bin, Time_frame, 2)
         target_len: (Batch,) Tensor or int or None
-        return: (Batch, 1, Time) 
+        return: (Batch, 1, Time)
         """
         real = spec[..., 0]
         imag = spec[..., 1]
         feat = torch.cat([real, imag], dim=1)
-        
+
         conv_target_len = None
         if target_len is not None:
             if torch.is_tensor(target_len):
@@ -226,7 +214,7 @@ class SuperResDecoder(nn.Module):
             else:
                 actual_target_len = int(target_len)
             conv_target_len = (actual_target_len + self.n_fft,)
-        
+
         waveform = self.dec(feat, output_size=conv_target_len)
         pad_amount = self.n_fft // 2
         if pad_amount > 0:
@@ -237,211 +225,129 @@ class SuperResDecoder(nn.Module):
         return waveform
 
 
+class ComplexDownsampler(nn.Module):
+    """
+    把 high-res 复数谱 (B, T_hi, F_hi) 下采样到目标档 (B, T_lo, F_lo)。
+    用 2->2 通道 Conv2d 在复数域学习最优下采样核，修复了实数三角窗破坏相位的问题。
+    初始化为恒等（中心抽取），便于起步。
+    """
+    def __init__(self, time_stride, freq_stride, kt=3, kf=7):
+        super().__init__()
+        self.time_stride = time_stride
+        self.freq_stride = freq_stride
+        self.conv = nn.Conv2d(2, 2, kernel_size=(kt, kf),
+                              stride=(time_stride, freq_stride),
+                              padding=(kt // 2, kf // 2), bias=False)
+        nn.init.zeros_(self.conv.weight)
+        with torch.no_grad():
+            self.conv.weight[0, 0, kt // 2, kf // 2] = 1.0
+            self.conv.weight[1, 1, kt // 2, kf // 2] = 1.0
+
+    def forward(self, Z):
+        """Z: (B, T, F) 复 -> (B, T', F') 复。"""
+        x = torch.stack([Z.real, Z.imag], dim=1)   # (B, 2, T, F)
+        y = self.conv(x)                            # (B, 2, T', F')
+        return torch.complex(y[:, 0], y[:, 1])      # (B, T', F')
+
+
 class MultiResConsistencyLoss(nn.Module):
     def __init__(self, config: STFTConfig):
         super().__init__()
         self.config = config
         self.kernel_win = nn.ParameterDict()
-        self.freq_downsamplers = nn.ModuleDict()
 
         for win_ms, hop_ms in self.config.target_resolutions:
-
-            # 1. Time Downsampling Kernels
             target_hop_len = int(self.config.sr * hop_ms / 1000)
             base_hop_len = self.config.base_hop_len
-            time_factor = target_hop_len // base_hop_len
-            time_factor = max(1, time_factor)
+            time_factor = max(1, target_hop_len // base_hop_len)
             key = str(time_factor)
             if time_factor > 1 and key not in self.kernel_win:
-                weight = torch.ones(time_factor)
-                self.kernel_win[key] = nn.Parameter(weight)
-            
-            # 2. Frequency Downsampling Matrices
+                self.kernel_win[key] = nn.Parameter(torch.ones(time_factor))
+
             target_win_len = int(self.config.sr * win_ms / 1000)
             base_win_len = self.config.base_win_len
             if base_win_len > target_win_len:
                 n_freq_in = base_win_len // 2 + 1
                 n_freq_out = target_win_len // 2 + 1
                 mat = create_triangular_filterbank(n_freq_in, n_freq_out, self.config.sr)
-                key_freq = f"mat_{win_ms}_{hop_ms}"
-                self.register_buffer(key_freq, mat)
+                self.register_buffer(f"mat_{win_ms}_{hop_ms}", mat)
 
     def forward(self, pred_super_complex, raw_audio, verbose=False):
         total_loss = 0.0
         details = {}
         device = pred_super_complex.device
-        
+
         base_win_len = self.config.base_win_len
         base_hop_len = self.config.base_hop_len
-
-        # =====================================================================
-        # Control Variable: 'none', '2_extreme', or '6_all'
-        # Defaulting to '2_extreme' if not explicitly set in config
-        # =====================================================================
-        mask_type = getattr(self.config, 'mask_type', '2_extreme')
-        global_mask = None
-
-        if mask_type != 'none':
-            with torch.no_grad():
-                if mask_type == '6_all':
-                    # [Method 1] 6-Resolution Intersection Mask (log-space geometric mean)
-                    num_res = len(self.config.target_resolutions)
-                    log_sum = None
-                    for win_ms, hop_ms in self.config.target_resolutions:
-                        n_fft_curr = int(self.config.sr * win_ms / 1000)
-                        stft_curr = torch.stft(
-                            raw_audio.squeeze(1), n_fft=n_fft_curr, hop_length=base_hop_len,
-                            win_length=n_fft_curr, window=torch.hann_window(n_fft_curr).to(device),
-                            center=True, return_complex=True
-                        )
-                        mag_curr = torch.abs(stft_curr)
-                        if base_win_len > n_fft_curr:
-                            key_freq = f"mat_{win_ms}_{hop_ms}"
-                            W_curr = getattr(self, key_freq)
-                            mag_proj = torch.einsum('bot,oi->bit', mag_curr, W_curr)
-                        else:
-                            mag_proj = mag_curr
-
-                        log_mag = torch.log(mag_proj + 1e-8)
-                        log_sum = log_mag if log_sum is None else log_sum + log_mag
-
-                    global_mask = torch.exp(log_sum / num_res)
-
-                elif mask_type == '2_extreme':
-                    # [Method 2] 2-Extreme Mask (Max Win & Min Win)
-                    max_win_ms, max_hop_ms = self.config.target_resolutions[0]
-                    min_win_ms, min_hop_ms = self.config.target_resolutions[-1]
-                    
-                    n_fft_long = int(self.config.sr * max_win_ms / 1000)
-                    stft_long = torch.stft(
-                        raw_audio.squeeze(1), n_fft=n_fft_long, hop_length=base_hop_len, win_length=n_fft_long,
-                        window=torch.hann_window(n_fft_long).to(device), center=True, return_complex=True
-                    )
-                    mag_long = torch.abs(stft_long)
-                    
-                    n_fft_short = int(self.config.sr * min_win_ms / 1000)
-                    stft_short = torch.stft(
-                        raw_audio.squeeze(1), n_fft=n_fft_short, hop_length=base_hop_len, win_length=n_fft_short,
-                        window=torch.hann_window(n_fft_short).to(device), center=True, return_complex=True
-                    )
-                    mag_short = torch.abs(stft_short)
-                    
-                    key_freq = f"mat_{min_win_ms}_{min_hop_ms}"
-                    W_short = getattr(self, key_freq)
-                    mag_short_proj = torch.einsum('bot,oi->bit', mag_short, W_short) 
-                    
-                    global_mask = torch.sqrt(mag_long * mag_short_proj + 1e-8)
-
-                # Normalize and apply clamp for both mask types
-                max_val, _ = global_mask.flatten(1).max(dim=1)
-                global_mask = global_mask / (max_val.view(-1, 1, 1) + 1e-8)
-                global_mask = torch.clamp(global_mask, min=0.05)
-                # print(f"Global Mask Created with type '{mask_type}' and shape {global_mask.shape}")
-        # =====================================================================
+        pad = base_win_len // 2
 
         if verbose:
-            print(f"\n[Loss Debug] Base Complex Shape: {pred_super_complex.shape}, Mask Type: {mask_type}")
+            print(f"\n[MultiResLoss] Base Complex Shape: {pred_super_complex.shape}")
 
         for i, (win_ms, hop_ms) in enumerate(self.config.target_resolutions):
             target_win_len = int(self.config.sr * win_ms / 1000)
             target_hop_len = int(self.config.sr * hop_ms / 1000)
-            
-            # 1. GT
-            gt_complex_tensor = torch.stft(
-                raw_audio.squeeze(1), 
-                n_fft=target_win_len, 
-                hop_length=target_hop_len, 
-                win_length=target_win_len, 
-                window=torch.hann_window(target_win_len).to(device),
-                center=True,
-                return_complex=True
-            )
-            gt_view = torch.view_as_real(gt_complex_tensor) 
-            
-            curr_pred = pred_super_complex
-            curr_mask = global_mask 
-            
-            # 2. Freq Downsampling
-            if base_win_len > target_win_len:
-                key_freq = f"mat_{win_ms}_{hop_ms}"
-                W = getattr(self, key_freq)
-                curr_pred = torch.einsum('bitc,oi->botc', curr_pred, W)
-                
-                if curr_mask is not None:
-                    curr_mask = torch.einsum('bit,oi->bot', curr_mask, W)
 
-            # 3. Time Downsampling
-            time_factor = target_hop_len // base_hop_len
-            time_factor = max(1, time_factor)
-            
+            # 1. GT STFT（左对齐，统一 pad=512）
+            gt_complex_tensor = stft_left_aligned(
+                raw_audio.squeeze(1), target_win_len, target_hop_len,
+                target_win_len, torch.hann_window(target_win_len).to(device), pad
+            )
+            gt_view = torch.view_as_real(gt_complex_tensor)
+
+            curr_pred = pred_super_complex
+
+            # 2. 频率下采样（三角滤波器组）
+            if base_win_len > target_win_len:
+                W = getattr(self, f"mat_{win_ms}_{hop_ms}")
+                curr_pred = torch.einsum('bitc,oi->botc', curr_pred, W)
+
+            # 3. 时间下采样（带相位旋转补偿）
+            time_factor = max(1, target_hop_len // base_hop_len)
             if time_factor > 1:
                 curr_pred_complex = torch.view_as_complex(curr_pred.contiguous())
                 B, n_freq, n_time = curr_pred_complex.shape
-                
+
                 remainder = n_time % time_factor
                 if remainder != 0:
-                    pad_amount = time_factor - remainder
-                    curr_pred_complex = F.pad(curr_pred_complex, (0, pad_amount), mode='constant', value=0)
-                    if curr_mask is not None:
-                        curr_mask = F.pad(curr_mask, (0, pad_amount), mode='constant', value=0.05)
+                    curr_pred_complex = F.pad(curr_pred_complex, (0, time_factor - remainder))
 
-                n_time_padded = curr_pred_complex.shape[-1]
-                n_blocks = n_time_padded // time_factor
-                
+                n_blocks = curr_pred_complex.shape[-1] // time_factor
                 curr_pred_unfolded = curr_pred_complex.view(B, n_freq, n_blocks, time_factor)
-                
-                freqs = torch.fft.rfftfreq(target_win_len, d=1.0/self.config.sr).to(device)
+
+                freqs = torch.fft.rfftfreq(target_win_len, d=1.0 / self.config.sr).to(device)
                 t_indices = torch.arange(time_factor).to(device)
                 base_hop_sec = base_hop_len / self.config.sr
-                theta = -2 * torch.pi * freqs.unsqueeze(1) * t_indices.unsqueeze(0) * base_hop_sec 
-                
+                theta = -2 * torch.pi * freqs.unsqueeze(1) * t_indices.unsqueeze(0) * base_hop_sec
+
                 rot_complex = torch.polar(torch.ones_like(theta), theta)
                 kernel = self.kernel_win[str(time_factor)]
                 weighted_spec = curr_pred_unfolded * rot_complex.unsqueeze(0).unsqueeze(2) * kernel.view(1, 1, 1, -1)
-                
-                curr_pred_reduced = weighted_spec.mean(dim=3)
-                curr_pred = torch.view_as_real(curr_pred_reduced)
-                
-                if curr_mask is not None:
-                    curr_mask_unfolded = curr_mask.view(B, n_freq, n_blocks, time_factor)
-                    curr_mask = curr_mask_unfolded.mean(dim=3)
-                
-            # 4. Loss Mask Assignment
-            assert curr_pred.shape == gt_view.shape, f"Shape mismatch: Pred {curr_pred.shape}, GT {gt_view.shape}"
+
+                curr_pred = torch.view_as_real(weighted_spec.mean(dim=3))
+
+            # 4. Loss
             min_f = min(curr_pred.shape[1], gt_view.shape[1])
             min_t = min(curr_pred.shape[2], gt_view.shape[2])
-            
             pred_crop = curr_pred[:, :min_f, :min_t, :]
             gt_crop = gt_view[:, :min_f, :min_t, :]
-            
-            if curr_mask is not None:
-                mask_crop = curr_mask[:, :min_f, :min_t]
-                mask_crop = mask_crop / (mask_crop.mean() + 1e-8)
-            else:
-                mask_crop = 1.0 # Broadcasting allows seamless unweighted operation
-            
-            # 5. Loss Calculation
-            loss_real_unreduced = F.mse_loss(pred_crop[..., 0], gt_crop[..., 0], reduction='none')
-            loss_real = (loss_real_unreduced * mask_crop).mean()
-            
-            loss_imag_unreduced = F.mse_loss(pred_crop[..., 1], gt_crop[..., 1], reduction='none')
-            loss_imag = (loss_imag_unreduced * mask_crop).mean()
 
-            pred_mag = torch.norm(pred_crop, dim=-1)
-            gt_mag = torch.norm(gt_crop, dim=-1)
-            # pred_mag = torch.clamp(pred_mag, min=1e-6)
-            # gt_mag = torch.clamp(gt_mag, min=1e-6)
-            pred_mag_compressed = torch.log1p(pred_mag * 10.0)
-            gt_mag_compressed = torch.log1p(gt_mag * 10.0)
-            loss_mag_unreduced = F.mse_loss(pred_mag_compressed, gt_mag_compressed, reduction='none')
-            loss_mag = (loss_mag_unreduced * mask_crop).mean()
-            
-            current_total_loss = loss_real * self.config.real_weight + loss_imag * self.config.imag_weight + loss_mag * self.config.mag_weight
-            current_total_loss = current_total_loss * self.config.resolution_weights[i]
-            
+            loss_real = F.mse_loss(pred_crop[..., 0], gt_crop[..., 0])
+            loss_imag = F.mse_loss(pred_crop[..., 1], gt_crop[..., 1])
+
+            pred_mag = torch.norm(pred_crop, dim=-1).clamp(min=1e-6)
+            gt_mag = torch.norm(gt_crop, dim=-1).clamp(min=1e-6)
+            loss_mag = F.mse_loss(torch.log(pred_mag), torch.log(gt_mag))
+
+            current_total_loss = (
+                loss_real * self.config.real_weight +
+                loss_imag * self.config.imag_weight +
+                loss_mag * self.config.mag_weight
+            ) * self.config.resolution_weights[i]
+
             total_loss += current_total_loss
             details[f"{win_ms}ms_{hop_ms}ms"] = current_total_loss.item()
-    
+
             if verbose:
                 print(f" Target [{i}]: Win={win_ms}ms, Hop={hop_ms}ms, T_factor={time_factor}")
                 print(f"   -> Aligned Shape: {curr_pred.shape}")
@@ -458,7 +364,7 @@ class HybridSupervisionLoss(MultiResConsistencyLoss):
     """
     Hybrid Supervision paradigm:
       - Magnitude (Target-Driven):    single loss against the 6-resolution min-intersection target.
-      - Real/Imag (Consistency-Driven): multi-resolution loop (existing downsampling + mask), magnitude term removed.
+      - Real/Imag (Consistency-Driven): multi-resolution loop, magnitude term removed.
     """
 
     def compute_intersection(self, raw_audio, verbose=False):
@@ -481,6 +387,7 @@ class HybridSupervisionLoss(MultiResConsistencyLoss):
         device = raw_audio.device
         base_win_len = self.config.base_win_len
         n_freq_base = base_win_len // 2 + 1
+        pad = base_win_len // 2
 
         cached_gt_stfts = {}
         mag_projs = []
@@ -490,10 +397,9 @@ class HybridSupervisionLoss(MultiResConsistencyLoss):
             n_fft_curr = int(self.config.sr * win_ms / 1000)
             target_hop_len = int(self.config.sr * hop_ms / 1000)
 
-            stft_curr = torch.stft(
-                raw_audio.squeeze(1), n_fft=n_fft_curr, hop_length=target_hop_len,
-                win_length=n_fft_curr, window=torch.hann_window(n_fft_curr).to(device),
-                center=True, return_complex=True
+            stft_curr = stft_left_aligned(
+                raw_audio.squeeze(1), n_fft_curr, target_hop_len,
+                n_fft_curr, torch.hann_window(n_fft_curr).to(device), pad
             )
             cached_gt_stfts[(win_ms, hop_ms)] = stft_curr
 
@@ -516,7 +422,7 @@ class HybridSupervisionLoss(MultiResConsistencyLoss):
 
             if verbose:
                 print(f"  [Intersection] Win={win_ms:2d}ms Hop={hop_ms:2d}ms | "
-                      f"STFT (B,F={n_fft_curr//2+1},T={T_native}) → freq-proj (B,{n_freq_base},{T_native}) | "
+                      f"STFT (B,F={n_fft_curr//2+1},T={T_native}) -> freq-proj (B,{n_freq_base},{T_native}) | "
                       f"max={mag_curr.max():.4f}  mean={mag_curr.mean():.4f}")
 
         # Time projection: nearest-neighbor upsample → T_base
@@ -532,15 +438,15 @@ class HybridSupervisionLoss(MultiResConsistencyLoss):
                 mag_aligned = mag_proj
             mag_stack_aligned.append(mag_aligned)
             if verbose:
-                print(f"  [Intersection] Win={win_ms}ms | time-proj: {T_native} → {T_base}")
+                print(f"  [Intersection] Win={win_ms}ms | time-proj: {T_native} -> {T_base}")
 
         # Scale normalization: align all resolutions' max to the middle resolution
         n_res = len(mag_stack_aligned)
         ref_idx = n_res // 2
-        ref_max = mag_stack_aligned[ref_idx].flatten(1).max(dim=1).values  # (B,)
+        ref_max = mag_stack_aligned[ref_idx].flatten(1).max(dim=1).values
         mag_stack_normed = []
-        scale_tensors = []   # (B,) tensor per resolution, for applying to complex GT in Step 3
-        scale_factors = []   # scalar for logging
+        scale_tensors = []
+        scale_factors = []
         for mag_aligned in mag_stack_aligned:
             curr_max = mag_aligned.flatten(1).max(dim=1).values
             scale = ref_max / (curr_max + 1e-8)  # (B,)
@@ -573,9 +479,7 @@ class HybridSupervisionLoss(MultiResConsistencyLoss):
             print(f"\n[HybridLoss] pred_super_complex: {pred_super_complex.shape}  "
                   f"(B, F_base={n_freq_base}, T_enc, 2)")
 
-        # =====================================================================
-        # Step 1: Compute intersection target + cache GT STFTs for Step 3.
-        # =====================================================================
+        # Step 1: intersection 目标 + 缓存 GT STFT
         with torch.no_grad():
             intersection_mag, _, cached_gt_stfts, scale_tensors = \
                 self.compute_intersection(raw_audio, verbose=verbose)
@@ -584,12 +488,14 @@ class HybridSupervisionLoss(MultiResConsistencyLoss):
             global_mask = intersection_mag / (max_val.view(-1, 1, 1) + 1e-8)
             global_mask = torch.clamp(global_mask, min=0.05)
 
+        # intersection 用最小 hop 的 STFT 计算，帧数可能多于 encoder 输出，截断对齐
+        T_enc = pred_super_complex.shape[2]
+        global_mask = global_mask[:, :, :T_enc]
+
         if verbose:
             print(f"  [Step1] global_mask: min={global_mask.min():.3f}  max={global_mask.max():.3f}")
 
-        # =====================================================================
-        # Step 2: Magnitude Target Loss (single, base resolution)
-        # =====================================================================
+        # Step 2: 幅度目标 loss
         pred_mag = torch.norm(pred_super_complex, dim=-1)  # (B, F_base, T_enc)
         min_f = min(pred_mag.shape[1], intersection_mag.shape[1])
         min_t = min(pred_mag.shape[2], intersection_mag.shape[2])
@@ -602,12 +508,9 @@ class HybridSupervisionLoss(MultiResConsistencyLoss):
         details['loss_mag'] = loss_mag_target.item()
 
         if verbose:
-            print(f"\n  [Step2] pred_mag: {pred_mag.shape}  crop → (B, {min_f}, {min_t})")
-            print(f"  [Step2] Loss Mag Target: {loss_mag_target.item():.5f}")
+            print(f"\n  [Step2] Loss Mag Target: {loss_mag_target.item():.5f}")
 
-        # =====================================================================
-        # Step 3: Complex Consistency Loss (real + imag only, no mag term).
-        # =====================================================================
+        # Step 3: 复数一致性 loss（Re/Im）
         if verbose:
             print(f"\n  [Step3] Complex consistency loop:")
 
@@ -628,8 +531,7 @@ class HybridSupervisionLoss(MultiResConsistencyLoss):
 
             # Freq downsampling (triangular filterbank, same as parent class)
             if base_win_len > target_win_len:
-                key_freq = f"mat_{win_ms}_{hop_ms}"
-                W = getattr(self, key_freq)
+                W = getattr(self, f"mat_{win_ms}_{hop_ms}")
                 curr_pred = torch.einsum('bitc,oi->botc', curr_pred, W)
                 curr_mask = torch.einsum('bit,oi->bot', curr_mask, W)
 
@@ -641,9 +543,8 @@ class HybridSupervisionLoss(MultiResConsistencyLoss):
 
                 remainder = n_time % time_factor
                 if remainder != 0:
-                    pad_amount = time_factor - remainder
-                    curr_pred_complex = F.pad(curr_pred_complex, (0, pad_amount), value=0)
-                    curr_mask = F.pad(curr_mask, (0, pad_amount), value=0.05)
+                    curr_pred_complex = F.pad(curr_pred_complex, (0, time_factor - remainder))
+                    curr_mask = F.pad(curr_mask, (0, time_factor - remainder), value=0.05)
 
                 n_blocks = curr_pred_complex.shape[-1] // time_factor
                 curr_pred_unfolded = curr_pred_complex.view(B, n_freq, n_blocks, time_factor)
@@ -680,160 +581,128 @@ class HybridSupervisionLoss(MultiResConsistencyLoss):
             _imag_acc += loss_imag.item() * res_w
             _res_w_sum += res_w
 
-            if verbose:
-                print(f"        crop → (B, {min_f}, {min_t}) | Loss Mag: {loss_mag_target.item():.5f}  "
-                      f"Loss Real: {loss_real.item():.5f}  Imag: {loss_imag.item():.5f}  "
-                      f"Weighted: {current_loss.item():.5f}")
-
         details['loss_real'] = _real_acc / (_res_w_sum + 1e-8)
         details['loss_imag'] = _imag_acc / (_res_w_sum + 1e-8)
 
         return total_loss, details
 
 
-class MultiResPhaseConsistencyLoss(nn.Module):
-    """Per-channel, per-resolution anti-wrapping phase loss (v7).
-
-    For each resolution (win_ms, hop_ms):
-      1. Project encoder output (F_base, T_enc) → (F_r, T_r)
-         via triangular filterbank (freq) + block mean (time, no phase rotation)
-      2. Compute GT STFT at that resolution (no grad)
-      3. Energy-mask by GT power
-      4. Compute per-channel:
-           IPL  = mean(f_AW(∠proj - ∠gt))
-           IAFL = mean(f_AW(∠(proj[:,t+1]·proj[:,t]*) - ∠(gt[:,t+1]·gt[:,t]*)))
-           GDL  = mean(f_AW(∠(proj[k+1,:]·proj[k,:]*)  - ∠(gt[k+1,:]·gt[k,:]*)))
-
-    Anti-wrapping: f_AW(x) = |x - 2π·round(x/(2π))|
-
-    Unlike CrossChannelPhaseLoss (v5), this is fully per-channel and projects
-    encoder features to each target resolution before comparison.
+class MultiScalePhaseAuxLoss(nn.Module):
     """
+    多尺度相位辅助损失。
 
+    编码器输出 (B, F, T, 2) 经 ComplexDownsampler 下采样到各档时频网格，
+    在复数域对齐到该档真实 STFT 的相位谱，监督 GD（群延迟）、IF（瞬时频率）
+    和 IP（瞬时相位）三项反缠绕损失。
+
+    所有 GT STFT 使用统一 512 外部补零 + center=False，与 encoder 的
+    F.pad(x, (512, 512)) 约定完全一致。
+    """
     def __init__(self, config: STFTConfig,
-                 ipl_weight: float = 1.0,
-                 iafl_weight: float = 1.0,
-                 gdl_weight: float = 0.5,
-                 resolution_weights=None,
-                 eps: float = 1e-8):
+                 scale_wins_ms=(1, 2, 4, 8, 16, 32),
+                 win_name="hann",
+                 w_ip=0.2, w_gd=1.0, w_if=1.0,
+                 trainable_down=True):
         super().__init__()
-        self.config      = config
-        self.ipl_weight  = ipl_weight
-        self.iafl_weight = iafl_weight
-        self.gdl_weight  = gdl_weight
-        self.eps         = eps
+        self.config = config
+        self.win_name = win_name
+        self.w_ip, self.w_gd, self.w_if = w_ip, w_gd, w_if
+        self.pad_amount = config.base_win_len // 2   # = 512
 
-        n_res = len(config.target_resolutions)
-        if resolution_weights is None:
-            self.resolution_weights = [1.0 / n_res] * n_res
-        else:
-            total = sum(resolution_weights) + 1e-8
-            self.resolution_weights = [w / total for w in resolution_weights]
+        hires_hop = config.base_hop_len              # 16 samples
+        hires_nfft = config.base_win_len             # 1024 samples
 
-        for win_ms, hop_ms in config.target_resolutions:
-            target_win_len = int(config.sr * win_ms / 1000)
-            self.register_buffer(f"win_{win_ms}_{hop_ms}",
-                                 torch.hann_window(target_win_len))
-            if config.base_win_len > target_win_len:
-                n_freq_in  = config.base_win_len  // 2 + 1
-                n_freq_out = target_win_len // 2 + 1
-                mat = create_triangular_filterbank(n_freq_in, n_freq_out, config.sr)
-                self.register_buffer(f"freq_mat_{win_ms}_{hop_ms}", mat)
+        self.scales = []
+        downs = []
+        for w_ms in scale_wins_ms:
+            n_fft = int(round(w_ms * 1e-3 * config.sr))
+            hop = n_fft // 2
+            F_lo = n_fft // 2 + 1
+            t_stride = max(1, hop // hires_hop)
+            # 频率下采样率：窗长比（DC 对齐，物理频率精确对应）
+            f_stride = hires_nfft // n_fft
+            self.scales.append(dict(w_ms=w_ms, n_fft=n_fft, hop=hop,
+                                    F_lo=F_lo, t_stride=t_stride, f_stride=f_stride))
+            d = ComplexDownsampler(t_stride, f_stride)
+            for p in d.parameters():
+                p.requires_grad = trainable_down
+            downs.append(d)
+        self.downsamplers = nn.ModuleList(downs)
 
     @staticmethod
-    def f_aw(x: torch.Tensor) -> torch.Tensor:
-        """Anti-wrapping function: |x - 2π·round(x/(2π))|"""
-        return torch.abs(x - 2.0 * math.pi * torch.round(x / (2.0 * math.pi)))
+    def _gd(phase):
+        """群延迟：沿频率轴差分，反缠绕。(B,T,F) -> (B,T,F-1)。"""
+        return anti_wrap(phase[..., 1:] - phase[..., :-1])
 
-    def _project_batch(self, enc_batch: torch.Tensor, win_ms: int, hop_ms: int) -> torch.Tensor:
-        """Project (C, F_base, T_enc) → (C, F_r, T_r) in one batched operation."""
-        target_win_len = int(self.config.sr * win_ms / 1000)
-        if self.config.base_win_len > target_win_len:
-            W    = getattr(self, f"freq_mat_{win_ms}_{hop_ms}")  # (F_r, F_base)
-            proj = torch.complex(
-                torch.einsum('rf,cft->crt', W, enc_batch.real),
-                torch.einsum('rf,cft->crt', W, enc_batch.imag),
-            )
-        else:
-            proj = enc_batch  # (C, F_base, T_enc)
+    @staticmethod
+    def _if(phase):
+        """瞬时频率：沿时间轴差分，反缠绕。(B,T,F) -> (B,T-1,F)。"""
+        return anti_wrap(phase[:, 1:, :] - phase[:, :-1, :])
 
-        target_hop_len = int(self.config.sr * hop_ms / 1000)
-        time_factor    = max(1, target_hop_len // self.config.base_hop_len)
-        if time_factor > 1:
-            C, F_r, T_enc = proj.shape
-            remainder = T_enc % time_factor
-            if remainder != 0:
-                proj = F.pad(proj, (0, time_factor - remainder))
-            proj = proj.view(C, F_r, proj.shape[-1] // time_factor, time_factor).mean(dim=-1)
+    def _phase_terms_loss(self, pred_c, tgt_phase):
+        pred_phase = torch.angle(pred_c)
+        L_ip = anti_wrap(pred_phase - tgt_phase).abs().mean()
+        L_gd = (self._gd(pred_phase) - self._gd(tgt_phase)).abs().mean()
+        L_if = (self._if(pred_phase) - self._if(tgt_phase)).abs().mean()
+        return L_ip, L_gd, L_if
 
-        return proj  # (C, F_r, T_r) complex
-
-    def _safe_angle(self, z: torch.Tensor) -> torch.Tensor:
-        return torch.angle(z / (z.abs() + self.eps))
-
-    def _phase_losses_batch(self, proj: torch.Tensor, gt: torch.Tensor):
-        """Compute IPL, IAFL, GDL for batched (C, F_r, T_r) complex tensors."""
-        ipl  = self.f_aw(self._safe_angle(proj) - self._safe_angle(gt)).mean()
-
-        pred_tf = proj[:, :, 1:] * proj[:, :, :-1].conj()
-        gt_tf   = gt[:, :, 1:]   * gt[:, :, :-1].conj()
-        iafl    = self.f_aw(self._safe_angle(pred_tf) - self._safe_angle(gt_tf)).mean()
-
-        pred_ff = proj[:, 1:, :] * proj[:, :-1, :].conj()
-        gt_ff   = gt[:, 1:, :]   * gt[:, :-1, :].conj()
-        gdl     = self.f_aw(self._safe_angle(pred_ff) - self._safe_angle(gt_ff)).mean()
-
-        return ipl, iafl, gdl
-
-    def forward(self, enc_mc_ri: torch.Tensor, speech_mc: torch.Tensor):
+    def forward(self, enc_ri, raw_audio, verbose=False):
         """
-        Args:
-            enc_mc_ri: (C, F_base, T_enc, 2)  encoder output [real, imag]
-            speech_mc: (C, T)                  waveforms for GT STFT reference
+        enc_ri:    (B, F, T, 2)  encoder 输出
+        raw_audio: (B, 1, T) 或 (B, T)  原始波形
+        verbose:   打印每档维度和损失细节
         """
-        enc_mc_c = torch.view_as_complex(enc_mc_ri.contiguous())  # (C, F_base, T_enc)
+        # 转换 encoder 输出为 (B, T, F) 复数
+        enc_c = torch.view_as_complex(enc_ri.contiguous())  # (B, F, T)
+        Z_hires = enc_c.permute(0, 2, 1).contiguous()       # (B, T, F)
 
-        total_loss = enc_mc_ri.new_zeros(())
-        sum_ipl = sum_iafl = sum_gdl = 0.0
-        per_res: dict = {}
+        wav = raw_audio.squeeze(1) if raw_audio.dim() == 3 else raw_audio
 
-        for res_idx, (win_ms, hop_ms) in enumerate(self.config.target_resolutions):
-            target_win_len = int(self.config.sr * win_ms / 1000)
-            target_hop_len = int(self.config.sr * hop_ms / 1000)
-            res_w          = self.resolution_weights[res_idx]
+        if verbose:
+            print(f"\n[MultiScalePhaseAuxLoss] enc_ri: {tuple(enc_ri.shape)}  "
+                  f"Z_hires: {tuple(Z_hires.shape)}  wav: {tuple(wav.shape)}  "
+                  f"pad={self.pad_amount}")
 
+        details = {}
+        total = enc_ri.new_zeros(())
+
+        for cfg, down in zip(self.scales, self.downsamplers):
+            # 1) 复数域下采样 encoder 输出到该档时频网格
+            pred = down(Z_hires)                             # (B, T', F')
+
+            # 2) GT STFT（统一 512 补零 + center=False，帧数若多于 pred 则在步骤 3 截断）
             with torch.no_grad():
-                win_fn = getattr(self, f"win_{win_ms}_{hop_ms}")
-                gt_mc  = torch.stft(
-                    speech_mc, n_fft=target_win_len,
-                    hop_length=target_hop_len, win_length=target_win_len,
-                    window=win_fn, center=True, return_complex=True,
-                )  # (C, F_r, T_gt)
+                window = getattr(torch, f"{self.win_name}_window")(
+                    cfg["n_fft"], periodic=True, device=wav.device, dtype=wav.dtype)
+                S_tgt = stft_left_aligned(
+                    wav, cfg["n_fft"], cfg["hop"], cfg["n_fft"], window, self.pad_amount
+                ).transpose(1, 2).contiguous()              # (B, T_lo, F_lo)
+                tgt_phase = torch.angle(S_tgt)
 
-            proj_mc = self._project_batch(enc_mc_c, win_ms, hop_ms)  # (C, F_r, T_r)
-            T       = min(proj_mc.shape[2], gt_mc.shape[2])
-            proj_mc = proj_mc[:, :, :T]
-            gt_mc   = gt_mc[:, :, :T]
+            # 3) 裁到公共 (T, F)
+            T = min(pred.shape[1], S_tgt.shape[1])
+            Fc = min(pred.shape[2], S_tgt.shape[2])
+            pred = pred[:, :T, :Fc]
+            tgt_phase = tgt_phase[:, :T, :Fc]
 
-            ipl, iafl, gdl = self._phase_losses_batch(proj_mc, gt_mc)
-            total_loss = total_loss + (
-                self.ipl_weight  * ipl  +
-                self.iafl_weight * iafl +
-                self.gdl_weight  * gdl
-            ) * res_w
+            # 4) 三项反缠绕相位损失
+            L_ip, L_gd, L_if = self._phase_terms_loss(pred, tgt_phase)
+            L = self.w_ip * L_ip + self.w_gd * L_gd + self.w_if * L_if
+            total = total + L
+            details[f"{cfg['w_ms']}ms"] = dict(
+                ip=L_ip.item(), gd=L_gd.item(), if_=L_if.item(), total=L.item())
 
-            ri, rai, rg = ipl.item(), iafl.item(), gdl.item()
-            per_res[f"{win_ms}ms_{hop_ms}ms"] = {
-                "ipl": ri, "iafl": rai, "gdl": rg,
-                "total": (ri * self.ipl_weight + rai * self.iafl_weight + rg * self.gdl_weight) * res_w,
-            }
-            sum_ipl += ri; sum_iafl += rai; sum_gdl += rg
+            if verbose:
+                print(f"  [{cfg['w_ms']:>2}ms] n_fft={cfg['n_fft']:4d}  hop={cfg['hop']:4d}  "
+                      f"t_stride={cfg['t_stride']}  f_stride={cfg['f_stride']}  "
+                      f"pred:{tuple(pred.shape)}  gt:{tuple(tgt_phase.shape)}  "
+                      f"ip={L_ip.item():.4f}  gd={L_gd.item():.4f}  if={L_if.item():.4f}  "
+                      f"L={L.item():.4f}")
 
-        n_res = len(self.config.target_resolutions)
-        return total_loss, {
-            "ipl": sum_ipl / n_res, "iafl": sum_iafl / n_res, "gdl": sum_gdl / n_res,
-            "per_res": per_res,
-        }
+        if verbose:
+            print(f"  [total] {total.item():.4f}  scales={list(details.keys())}")
+
+        return total, details
 
 
 class GOMPSNRLoss(nn.Module):
@@ -853,24 +722,18 @@ class GOMPSNRLoss(nn.Module):
         if x_recon.dim() == 3: x_recon = x_recon.squeeze(1)
         if x_gt.dim() == 3: x_gt = x_gt.squeeze(1)
 
-        spec_recon = torch.stft(
-            x_recon, n_fft=self.n_fft, hop_length=self.hop_len, 
-            win_length=self.win_len, window=self.window, 
-            return_complex=True
-        )
-        spec_gt = torch.stft(
-            x_gt, n_fft=self.n_fft, hop_length=self.hop_len, 
-            win_length=self.win_len, window=self.window, 
-            return_complex=True
-        )
+        pad = self.n_fft // 2
+        spec_recon = stft_left_aligned(x_recon, self.n_fft, self.hop_len,
+                                       self.win_len, self.window, pad)
+        spec_gt = stft_left_aligned(x_gt, self.n_fft, self.hop_len,
+                                       self.win_len, self.window, pad)
 
-        rea_g, imag_g = spec_recon.real, spec_recon.imag
-        rea, imag = spec_gt.real, spec_gt.imag
         eps = 1e-6
-        rea_g = rea_g + eps
-        imag_g = imag_g + eps
-        rea = rea + eps
-        imag = imag + eps
+        rea_g = spec_recon.real + eps
+        imag_g = spec_recon.imag + eps
+        rea = spec_gt.real + eps
+        imag = spec_gt.imag + eps
+
         mag = torch.sqrt(rea**2 + imag**2 + 1e-8)
         pha_g = torch.atan2(imag_g, rea_g)
         pha = torch.atan2(imag, rea)
@@ -889,7 +752,7 @@ class GOMPSNRLoss(nn.Module):
             loss_dict['loss_cori'] = l_cori.item()
 
         return total_loss, loss_dict
-    
+
 
 class SISNRLoss(nn.Module):
     def __init__(self, eps=1e-8):
@@ -930,24 +793,10 @@ class SISNRLoss(nn.Module):
         return -torch.mean(si_snr)
 
 
-def compute_entropy_loss(pred_complex):
-    mag = torch.norm(pred_complex, dim=-1)
-    p = mag / (torch.sum(mag, dim=(1, 2), keepdim=True) + 1e-8)
-    entropy = -torch.sum(p * torch.log(p + 1e-8), dim=(1, 2))
-    return entropy.mean()
-
-def compute_tv_loss(pred_complex):
-    mag = torch.norm(pred_complex, dim=-1)
-    tv_f = torch.abs(mag[:, 1:, :] - mag[:, :-1, :]).mean()
-    tv_t = torch.abs(mag[:, :, 1:] - mag[:, :, :-1]).mean()
-    return tv_f + tv_t
-
-
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Running on device: {device}\n")
 
-    # 1. 加载配置 (优先加载 yaml)
     import os
     config_path = "config.yaml"
     if os.path.exists(config_path):
@@ -956,52 +805,54 @@ if __name__ == "__main__":
     else:
         print("Config file not found, using defaults")
         cfg = STFTConfig()
-        
+
     print(f"Config: {cfg}")
-    
-    # 2. Models
+
     encoder = SuperResEncoder(cfg).to(device)
     decoder = SuperResDecoder(cfg).to(device)
-    mrc_loss = HybridSupervisionLoss(cfg).to(device)
+    hybrid_loss = HybridSupervisionLoss(cfg).to(device)
+    phase_loss = MultiScalePhaseAuxLoss(cfg).to(device)
     gompsnr_loss = GOMPSNRLoss(cfg).to(device)
     sisnr_loss = SISNRLoss().to(device)
-    
-    # 3. Data
-    # rand_len = int(38791 * 1.0)
-    # x = torch.randn(1, 1, rand_len).to(device)
+
     audio_data, sr = sf.read("../egs2/vctk_noisy/enh1/dump/raw/tt_2spk/data/wav/format.1/p232_001.flac", dtype='float32')
     if audio_data.ndim > 1:
         audio_data = audio_data[:, 0]
     x = torch.from_numpy(audio_data).unsqueeze(0).unsqueeze(0).to(device)
     rand_len = x.shape[-1]
     print(f"\nInput Audio: {x.shape}")
-    
-    # 4. Forward & Backward
+
     z_complex = encoder(x)
-    entropy_loss = compute_entropy_loss(z_complex)
-    tv_loss = compute_tv_loss(z_complex)
-    multi_loss, multi_details = mrc_loss(z_complex, x, verbose=True)
+
+    multi_loss, multi_details = hybrid_loss(z_complex, x, verbose=True)
+    phase_l, phase_details = phase_loss(z_complex, x, verbose=True)
+
     x_recon = decoder(z_complex, torch.tensor([rand_len]))
     recon_loss = F.mse_loss(x, x_recon)
-    gompsnr_loss, gompsnr_details = gompsnr_loss(x_recon, x)
-    sisnr_loss = sisnr_loss(x_recon, x)
+    gompsnr_l, gompsnr_details = gompsnr_loss(x_recon, x)
+    sisnr_l = sisnr_loss(x_recon, x)
 
-    print(f"Output audio: {x_recon.shape}")
-    
-    # Aggregate
-    total_loss = multi_loss * cfg.multi_res_weight + recon_loss * cfg.recon_weight + gompsnr_loss * cfg.gompsnr_weight + sisnr_loss * cfg.sisnr_weight + entropy_loss * cfg.entropy_weight + tv_loss * cfg.tv_weight
-    
+    print(f"\nOutput audio: {x_recon.shape}")
+
+    total_loss = (multi_loss * cfg.multi_res_weight +
+                  recon_loss * cfg.recon_weight      +
+                  gompsnr_l  * cfg.gompsnr_weight    +
+                  sisnr_l    * cfg.sisnr_weight)
+
     print(f"\nTotal Loss: {total_loss.item():.6f}")
     print(f"  MultiRes: {multi_loss.item():.6f}")
+    print(f"  Phase:    {phase_l.item():.6f}")
     print(f"  Recon:    {recon_loss.item():.6f}")
-    print(f"  GOMPSNR:  {gompsnr_loss.item():.6f}")
-    print(f"  SI-SNR:   {sisnr_loss.item():.6f}")
-    print(f"  Entropy:  {entropy_loss.item():.6f}")
-    print(f"  TV:       {tv_loss.item():.6f}")
+    print(f"  GOMPSNR:  {gompsnr_l.item():.6f}")
+    print(f"  SI-SNR:   {sisnr_l.item():.6f}")
 
-    optim = torch.optim.Adam(list(encoder.parameters()) + 
-                             list(decoder.parameters()) + 
-                             list(mrc_loss.parameters()), lr=1e-3)
+    optim = torch.optim.Adam(
+        list(encoder.parameters()) +
+        list(decoder.parameters()) +
+        list(hybrid_loss.parameters()) +
+        list(phase_loss.parameters()),
+        lr=1e-3
+    )
     optim.zero_grad()
     total_loss.backward()
     optim.step()
