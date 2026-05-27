@@ -9,26 +9,26 @@
 PYTHON="python"
 TRAIN_SCRIPT="train.py"
 BASE_CONFIG="config.yaml"
-SWEEP_ROOT="exp/sweep_loss"
+SWEEP_ROOT="exp/v7_phasew"
 
 # ------------------------------------------------------------------------------
 # 2. 参数扫描网格 (不想调节的参数，请将 VALS 设为空数组 ())
 # ------------------------------------------------------------------------------
 
-# --- 参数 1 ---
-KEY1="loss.multi_res_weight.weight"
-NAME1="mr"
-VALS1=(180.0 250.0 300.0)  # 正常调节
+# --- 参数 1: phase_weight ---
+KEY1="loss.phase_weight.weight"
+NAME1="pw"
+VALS1=(30.0 100.0)
 
-# --- 参数 2 (示例：不想调节这个，留空) ---
-KEY2="loss.gompsnr_weight.weight"
-NAME2="gom"
-VALS2=(100.0 200.0)             # <--- 留空，脚本会自动跳过此维度
+# --- 参数 2 (不调节) ---
+KEY2=""
+NAME2=""
+VALS2=()
 
-# --- 参数 3 (示例：不想调节这个，留空) ---
-KEY3="loss.recon_weight"
-NAME3="rec"
-VALS3=()             # <--- 留空，脚本会自动跳过此维度
+# --- 参数 3 (不调节) ---
+KEY3=""
+NAME3=""
+VALS3=()
 
 # ==============================================================================
 #  内部工具：Python YAML 修改器 (保持不变)
