@@ -279,19 +279,19 @@ class MultiResConsistencyLoss(nn.Module):
 
         base_win_len = self.config.base_win_len
         base_hop_len = self.config.base_hop_len
-        pad = base_win_len // 2
 
         if verbose:
-            print(f"\n[MultiResLoss] Base Complex Shape: {pred_super_complex.shape}")
+            print(f"\n[MultiResLoss] pred={tuple(pred_super_complex.shape)}")
 
         for i, (win_ms, hop_ms) in enumerate(self.config.target_resolutions):
             target_win_len = int(self.config.sr * win_ms / 1000)
             target_hop_len = int(self.config.sr * hop_ms / 1000)
 
-            # 1. GT STFT（左对齐，统一 pad=512）
+            # 1. GT STFT（左对齐，pad=n_fft//2 等价 center=True）
             gt_complex_tensor = stft_left_aligned(
                 raw_audio.squeeze(1), target_win_len, target_hop_len,
-                target_win_len, torch.hann_window(target_win_len).to(device), pad
+                target_win_len, torch.hann_window(target_win_len).to(device),
+                target_win_len // 2
             )
             gt_view = torch.view_as_real(gt_complex_tensor)
 
@@ -349,13 +349,10 @@ class MultiResConsistencyLoss(nn.Module):
             details[f"{win_ms}ms_{hop_ms}ms"] = current_total_loss.item()
 
             if verbose:
-                print(f" Target [{i}]: Win={win_ms}ms, Hop={hop_ms}ms, T_factor={time_factor}")
-                print(f"   -> Aligned Shape: {curr_pred.shape}")
-                print(f"   -> GT Shape:      {gt_view.shape}")
-                print(f"   -> Loss Real:     {loss_real.item():.5f}")
-                print(f"   -> Loss Imag:     {loss_imag.item():.5f}")
-                print(f"   -> Loss Mag:      {loss_mag.item():.5f}")
-                print(f"   -> Sum:           {current_total_loss.item():.5f}")
+                print(f"  [{win_ms}ms/{hop_ms}ms] n_fft={target_win_len}  hop={target_hop_len}  "
+                      f"T_factor={time_factor}  pred{tuple(curr_pred.shape)}  gt{tuple(gt_view.shape)}  "
+                      f"real={loss_real.item():.5f}  imag={loss_imag.item():.5f}  "
+                      f"mag={loss_mag.item():.5f}  sum={current_total_loss.item():.5f}")
 
         return total_loss, details
 
@@ -387,7 +384,6 @@ class HybridSupervisionLoss(MultiResConsistencyLoss):
         device = raw_audio.device
         base_win_len = self.config.base_win_len
         n_freq_base = base_win_len // 2 + 1
-        pad = base_win_len // 2
 
         cached_gt_stfts = {}
         mag_projs = []
@@ -399,7 +395,8 @@ class HybridSupervisionLoss(MultiResConsistencyLoss):
 
             stft_curr = stft_left_aligned(
                 raw_audio.squeeze(1), n_fft_curr, target_hop_len,
-                n_fft_curr, torch.hann_window(n_fft_curr).to(device), pad
+                n_fft_curr, torch.hann_window(n_fft_curr).to(device),
+                n_fft_curr // 2
             )
             cached_gt_stfts[(win_ms, hop_ms)] = stft_curr
 
@@ -421,8 +418,9 @@ class HybridSupervisionLoss(MultiResConsistencyLoss):
             mag_projs.append(mag_proj)
 
             if verbose:
-                print(f"  [Intersection] Win={win_ms:2d}ms Hop={hop_ms:2d}ms | "
-                      f"STFT (B,F={n_fft_curr//2+1},T={T_native}) -> freq-proj (B,{n_freq_base},{T_native}) | "
+                print(f"  [{win_ms}ms/{hop_ms}ms] n_fft={n_fft_curr}  hop={target_hop_len}  "
+                      f"STFT(B,F={n_fft_curr//2+1},T={T_native})  "
+                      f"→ freq-proj(B,{n_freq_base},{T_native})  "
                       f"max={mag_curr.max():.4f}  mean={mag_curr.mean():.4f}")
 
         # Time projection: nearest-neighbor upsample → T_base
@@ -438,15 +436,15 @@ class HybridSupervisionLoss(MultiResConsistencyLoss):
                 mag_aligned = mag_proj
             mag_stack_aligned.append(mag_aligned)
             if verbose:
-                print(f"  [Intersection] Win={win_ms}ms | time-proj: {T_native} -> {T_base}")
+                print(f"    time-proj: {T_native} → {T_base}")
 
         # Scale normalization: align all resolutions' max to the middle resolution
         n_res = len(mag_stack_aligned)
         ref_idx = n_res // 2
-        ref_max = mag_stack_aligned[ref_idx].flatten(1).max(dim=1).values
+        ref_max = mag_stack_aligned[ref_idx].flatten(1).max(dim=1).values  # (B,)
         mag_stack_normed = []
-        scale_tensors = []
-        scale_factors = []
+        scale_tensors = []   # (B,) tensor per resolution, for applying to complex GT in Step 3
+        scale_factors = []   # scalar for logging
         for mag_aligned in mag_stack_aligned:
             curr_max = mag_aligned.flatten(1).max(dim=1).values
             scale = ref_max / (curr_max + 1e-8)  # (B,)
@@ -458,10 +456,10 @@ class HybridSupervisionLoss(MultiResConsistencyLoss):
 
         if verbose:
             ref_win = self.config.target_resolutions[ref_idx][0]
-            print(f"\n  [Intersection] Scale norm ref=Win{ref_win}ms: "
-                  + "  ".join(f"Win{r[0]}ms×{s:.3f}" for r, s in
-                               zip(self.config.target_resolutions, scale_factors)))
-            print(f"  [Intersection] result: {intersection_mag.shape}  "
+            scales_str = " ".join(f"{r[0]}ms×{s:.3f}" for r, s in
+                                  zip(self.config.target_resolutions, scale_factors))
+            print(f"  scale norm (ref={ref_win}ms): {scales_str}")
+            print(f"  intersection{tuple(intersection_mag.shape)}  "
                   f"max={intersection_mag.max():.4f}  mean={intersection_mag.mean():.4f}")
 
         return intersection_mag, mag_stack_normed, cached_gt_stfts, scale_tensors
@@ -476,8 +474,8 @@ class HybridSupervisionLoss(MultiResConsistencyLoss):
         n_freq_base = base_win_len // 2 + 1
 
         if verbose:
-            print(f"\n[HybridLoss] pred_super_complex: {pred_super_complex.shape}  "
-                  f"(B, F_base={n_freq_base}, T_enc, 2)")
+            print(f"\n[HybridLoss] pred={tuple(pred_super_complex.shape)}  "
+                  f"(B, F={n_freq_base}, T_enc, 2)")
 
         # Step 1: intersection 目标 + 缓存 GT STFT
         with torch.no_grad():
@@ -493,7 +491,7 @@ class HybridSupervisionLoss(MultiResConsistencyLoss):
         global_mask = global_mask[:, :, :T_enc]
 
         if verbose:
-            print(f"  [Step1] global_mask: min={global_mask.min():.3f}  max={global_mask.max():.3f}")
+            print(f"  [Step1] global_mask min={global_mask.min():.3f}  max={global_mask.max():.3f}")
 
         # Step 2: 幅度目标 loss
         pred_mag = torch.norm(pred_super_complex, dim=-1)  # (B, F_base, T_enc)
@@ -508,11 +506,11 @@ class HybridSupervisionLoss(MultiResConsistencyLoss):
         details['loss_mag'] = loss_mag_target.item()
 
         if verbose:
-            print(f"\n  [Step2] Loss Mag Target: {loss_mag_target.item():.5f}")
+            print(f"  [Step2] mag_target={loss_mag_target.item():.5f}")
 
         # Step 3: 复数一致性 loss（Re/Im）
         if verbose:
-            print(f"\n  [Step3] Complex consistency loop:")
+            print(f"  [Step3] Re/Im consistency loop:")
 
         _real_acc = 0.0
         _imag_acc = 0.0
@@ -561,8 +559,8 @@ class HybridSupervisionLoss(MultiResConsistencyLoss):
                 curr_mask = curr_mask.view(B, n_freq, n_blocks, time_factor).mean(dim=3)
 
             if verbose:
-                print(f"   [{i}] Win={win_ms}ms Hop={hop_ms}ms T_factor={time_factor} | "
-                      f"curr_pred: {curr_pred.shape}  gt_view: {gt_view.shape}")
+                print(f"    [{win_ms}ms/{hop_ms}ms] n_fft={target_win_len}  hop={target_hop_len}  "
+                      f"T_factor={time_factor}  pred{tuple(curr_pred.shape)}  gt{tuple(gt_view.shape)}")
 
             min_f = min(curr_pred.shape[1], gt_view.shape[1])
             min_t = min(curr_pred.shape[2], gt_view.shape[2])
@@ -599,7 +597,7 @@ class MultiScalePhaseAuxLoss(nn.Module):
     F.pad(x, (512, 512)) 约定完全一致。
     """
     def __init__(self, config: STFTConfig,
-                 scale_wins_ms=(1, 2, 4, 8, 16, 32),
+                 scale_wins_ms=(64, 32, 16, 8, 4, 2),
                  win_name="hann",
                  w_ip=0.2, w_gd=1.0, w_if=1.0,
                  trainable_down=True):
@@ -659,9 +657,8 @@ class MultiScalePhaseAuxLoss(nn.Module):
         wav = raw_audio.squeeze(1) if raw_audio.dim() == 3 else raw_audio
 
         if verbose:
-            print(f"\n[MultiScalePhaseAuxLoss] enc_ri: {tuple(enc_ri.shape)}  "
-                  f"Z_hires: {tuple(Z_hires.shape)}  wav: {tuple(wav.shape)}  "
-                  f"pad={self.pad_amount}")
+            print(f"\n[PhaseLoss] enc_ri={tuple(enc_ri.shape)}  Z_hires={tuple(Z_hires.shape)}  "
+                  f"wav={tuple(wav.shape)}  pad={self.pad_amount}")
 
         details = {}
         total = enc_ri.new_zeros(())
@@ -678,10 +675,15 @@ class MultiScalePhaseAuxLoss(nn.Module):
                     wav, cfg["n_fft"], cfg["hop"], cfg["n_fft"], window, self.pad_amount
                 ).transpose(1, 2).contiguous()              # (B, T_lo, F_lo)
                 tgt_phase = torch.angle(S_tgt)
-
+            
             # 3) 裁到公共 (T, F)
             T = min(pred.shape[1], S_tgt.shape[1])
             Fc = min(pred.shape[2], S_tgt.shape[2])
+            if verbose:
+                print(f"  [{cfg['w_ms']:>2}ms] n_fft={cfg['n_fft']:>4d}  hop={cfg['hop']:>3d}  "
+                      f"t_stride={cfg['t_stride']}  f_stride={cfg['f_stride']}  "
+                      f"pred{tuple(pred.shape)}  gt{tuple(S_tgt.shape)}  "
+                      f"→ cut({T},{Fc})")
             pred = pred[:, :T, :Fc]
             tgt_phase = tgt_phase[:, :T, :Fc]
 
@@ -692,15 +694,8 @@ class MultiScalePhaseAuxLoss(nn.Module):
             details[f"{cfg['w_ms']}ms"] = dict(
                 ip=L_ip.item(), gd=L_gd.item(), if_=L_if.item(), total=L.item())
 
-            if verbose:
-                print(f"  [{cfg['w_ms']:>2}ms] n_fft={cfg['n_fft']:4d}  hop={cfg['hop']:4d}  "
-                      f"t_stride={cfg['t_stride']}  f_stride={cfg['f_stride']}  "
-                      f"pred:{tuple(pred.shape)}  gt:{tuple(tgt_phase.shape)}  "
-                      f"ip={L_ip.item():.4f}  gd={L_gd.item():.4f}  if={L_if.item():.4f}  "
-                      f"L={L.item():.4f}")
-
         if verbose:
-            print(f"  [total] {total.item():.4f}  scales={list(details.keys())}")
+            print(f"  [total] {total.item():.4f}")
 
         return total, details
 
@@ -815,36 +810,32 @@ if __name__ == "__main__":
     gompsnr_loss = GOMPSNRLoss(cfg).to(device)
     sisnr_loss = SISNRLoss().to(device)
 
-    audio_data, sr = sf.read("../egs2/vctk_noisy/enh1/dump/raw/tt_2spk/data/wav/format.1/p232_001.flac", dtype='float32')
-    if audio_data.ndim > 1:
-        audio_data = audio_data[:, 0]
-    x = torch.from_numpy(audio_data).unsqueeze(0).unsqueeze(0).to(device)
-    rand_len = x.shape[-1]
-    print(f"\nInput Audio: {x.shape}")
+    # audio_data, sr = sf.read("../egs2/vctk_noisy/enh1/dump/raw/tt_2spk/data/wav/format.1/p232_001.flac", dtype='float32')
+    # if audio_data.ndim > 1:
+    #     audio_data = audio_data[:, 0]
+    # x = torch.from_numpy(audio_data).unsqueeze(0).unsqueeze(0).to(device)
+    x = torch.randn(1, 1, 16000).to(device)
+    N = x.shape[-1]
+    print(f"\ninput: {tuple(x.shape)}  N={N}  T_enc={N // cfg.base_hop_len}")
+    z = encoder(x)
+    print(f"enc: {tuple(z.shape)}")
 
-    z_complex = encoder(x)
+    multi_loss, multi_details = hybrid_loss(z, x, verbose=True)
+    phase_l, phase_details = phase_loss(z, x, verbose=True)
 
-    multi_loss, multi_details = hybrid_loss(z_complex, x, verbose=True)
-    phase_l, phase_details = phase_loss(z_complex, x, verbose=True)
-
-    x_recon = decoder(z_complex, torch.tensor([rand_len]))
+    x_recon = decoder(z, torch.tensor([N]))
     recon_loss = F.mse_loss(x, x_recon)
     gompsnr_l, gompsnr_details = gompsnr_loss(x_recon, x)
     sisnr_l = sisnr_loss(x_recon, x)
 
-    print(f"\nOutput audio: {x_recon.shape}")
-
+    print(f"\nout: {tuple(x_recon.shape)}")
     total_loss = (multi_loss * cfg.multi_res_weight +
-                  recon_loss * cfg.recon_weight      +
-                  gompsnr_l  * cfg.gompsnr_weight    +
+                  recon_loss * cfg.recon_weight +
+                  gompsnr_l  * cfg.gompsnr_weight +
                   sisnr_l    * cfg.sisnr_weight)
 
-    print(f"\nTotal Loss: {total_loss.item():.6f}")
-    print(f"  MultiRes: {multi_loss.item():.6f}")
-    print(f"  Phase:    {phase_l.item():.6f}")
-    print(f"  Recon:    {recon_loss.item():.6f}")
-    print(f"  GOMPSNR:  {gompsnr_l.item():.6f}")
-    print(f"  SI-SNR:   {sisnr_l.item():.6f}")
+    print(f"  recon={recon_loss.item():.6f}  gompsnr={gompsnr_l.item():.4f}  sisnr={sisnr_l.item():.4f}  "
+          f"phase={phase_l.item():.4f}")
 
     optim = torch.optim.Adam(
         list(encoder.parameters()) +
